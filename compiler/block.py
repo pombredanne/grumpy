@@ -16,10 +16,15 @@
 
 """Classes for analyzing and storing the state of Python code blocks."""
 
+from __future__ import unicode_literals
+
 import abc
-import ast
 import collections
 import re
+
+from pythonparser import algorithm
+from pythonparser import ast
+from pythonparser import source
 
 from grumpy.compiler import expr
 from grumpy.compiler import util
@@ -33,11 +38,9 @@ class Package(object):
 
   def __init__(self, name, alias=None):
     self.name = name
-    if not alias:
       # Use Γ as a separator since it provides readability with a low
       # probability of name collisions.
-      alias = 'π_' + name.replace('/', 'Γ')
-    self.alias = alias
+    self.alias = alias or 'π_' + name.replace('/', 'Γ').replace('.', 'Γ')
 
 
 class Loop(object):
@@ -58,10 +61,11 @@ class Block(object):
   _filename = None
   _full_package_name = None
   _libroot = None
-  _lines = None
+  _buffer = None
   _runtime = None
   _strings = None
   imports = None
+  _future_features = None
 
   def __init__(self, parent_block, name):
     self.parent_block = parent_block
@@ -97,12 +101,17 @@ class Block(object):
     return self._module_block._filename  # pylint: disable=protected-access
 
   @property
-  def lines(self):
-    return self._module_block._lines  # pylint: disable=protected-access
+  def buffer(self):
+    return self._module_block._buffer  # pylint: disable=protected-access
 
   @property
   def strings(self):
     return self._module_block._strings  # pylint: disable=protected-access
+
+  @property
+  def future_features(self):
+    # pylint: disable=protected-access
+    return self._module_block._future_features
 
   @abc.abstractmethod
   def bind_var(self, writer, name, value):
@@ -216,15 +225,17 @@ class ModuleBlock(Block):
     imports: A dict mapping fully qualified Go package names to Package objects.
   """
 
-  def __init__(self, full_package_name, runtime, libroot, filename, lines):
-    super(ModuleBlock, self).__init__(None, '<module>')
+  def __init__(self, full_package_name, runtime, libroot, filename, src,
+               future_features):
+    Block.__init__(self, None, '<module>')
     self._full_package_name = full_package_name
     self._runtime = runtime
     self._libroot = libroot
     self._filename = filename
-    self._lines = lines
+    self._buffer = source.Buffer(src)
     self._strings = set()
     self.imports = {}
+    self._future_features = future_features
 
   def bind_var(self, writer, name, value):
     writer.write_checked_call1(
@@ -243,7 +254,7 @@ class ClassBlock(Block):
   """Python block for a class definition."""
 
   def __init__(self, parent_block, name, global_vars):
-    super(ClassBlock, self).__init__(parent_block, name)
+    Block.__init__(self, parent_block, name)
     self.global_vars = global_vars
 
   def bind_var(self, writer, name, value):
@@ -283,7 +294,7 @@ class FunctionBlock(Block):
   """Python block for a function definition."""
 
   def __init__(self, parent_block, name, block_vars, is_generator):
-    super(FunctionBlock, self).__init__(parent_block, name)
+    Block.__init__(self, parent_block, name)
     self.vars = block_vars
     self.parent_block = parent_block
     self.is_generator = is_generator
@@ -343,7 +354,7 @@ class Var(object):
       self.init_expr = None
 
 
-class BlockVisitor(ast.NodeVisitor):
+class BlockVisitor(algorithm.Visitor):
   """Visits nodes in a function or class to determine block variables."""
 
   # pylint: disable=invalid-name,missing-docstring
@@ -391,8 +402,9 @@ class BlockVisitor(ast.NodeVisitor):
       self._register_local(alias.asname or alias.name)
 
   def visit_With(self, node):
-    if node.optional_vars:
-      self._assign_target(node.optional_vars)
+    for item in node.items:
+      if item.optional_vars:
+        self._assign_target(item.optional_vars)
     self.generic_visit(node)
 
   def _assign_target(self, target):
@@ -415,8 +427,7 @@ class BlockVisitor(ast.NodeVisitor):
       self.vars[name] = Var(name, Var.TYPE_GLOBAL)
 
   def _register_local(self, name):
-    var = self.vars.get(name)
-    if not var:
+    if not self.vars.get(name):
       self.vars[name] = Var(name, Var.TYPE_LOCAL)
 
 
@@ -426,19 +437,19 @@ class FunctionBlockVisitor(BlockVisitor):
   # pylint: disable=invalid-name,missing-docstring
 
   def __init__(self, node):
-    super(FunctionBlockVisitor, self).__init__()
+    BlockVisitor.__init__(self)
     self.is_generator = False
     node_args = node.args
-    args = [a.id for a in node_args.args]
+    args = [a.arg for a in node_args.args]
     if node_args.vararg:
-      args.append(node_args.vararg)
+      args.append(node_args.vararg.arg)
     if node_args.kwarg:
-      args.append(node_args.kwarg)
+      args.append(node_args.kwarg.arg)
     for i, name in enumerate(args):
       if name in self.vars:
         msg = "duplicate argument '{}' in function definition".format(name)
         raise util.ParseError(node, msg)
       self.vars[name] = Var(name, Var.TYPE_PARAM, arg_index=i)
 
-  def visit_Yield(self, unused_node):
+  def visit_Yield(self, unused_node): # pylint: disable=unused-argument
     self.is_generator = True

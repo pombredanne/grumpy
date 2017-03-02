@@ -114,7 +114,9 @@ func (l *List) Sort(f *Frame) (raised *BaseException) {
 		}
 		raised = sorter.raised
 	}()
-	sort.Sort(sorter)
+	// Python guarantees stability.  See note (9) in:
+	// https://docs.python.org/2/library/stdtypes.html#mutable-sequence-types
+	sort.Stable(sorter)
 	return nil
 }
 
@@ -161,8 +163,45 @@ func listAppend(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
 	return None, nil
 }
 
+func listCount(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
+	if raised := checkMethodArgs(f, "count", args, ListType, ObjectType); raised != nil {
+		return nil, raised
+	}
+	return seqCount(f, args[0], args[1])
+}
+
+func listRemove(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
+	if raised := checkMethodArgs(f, "remove", args, ListType, ObjectType); raised != nil {
+		return nil, raised
+	}
+	value := args[1]
+	l := toListUnsafe(args[0])
+	l.mutex.Lock()
+	index, raised := seqFindElem(f, l.elems, value)
+	if raised == nil {
+		if index != -1 {
+			l.elems = append(l.elems[:index], l.elems[index+1:]...)
+		} else {
+			raised = f.RaiseType(ValueErrorType, "list.remove(x): x not in list")
+		}
+	}
+	l.mutex.Unlock()
+	if raised != nil {
+		return nil, raised
+	}
+	return None, nil
+}
+
+func listExtend(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+	argc := len(args)
+	if argc != 2 {
+		return nil, f.RaiseType(TypeErrorType, fmt.Sprintf("extend() takes exactly one argument (%d given)", argc))
+	}
+	return listIAdd(f, args[0], args[1])
+}
+
 func listContains(f *Frame, l, v *Object) (*Object, *BaseException) {
-	return seqContains(f, toListUnsafe(l).elems, v)
+	return seqContains(f, l, v)
 }
 
 func listEq(f *Frame, v, w *Object) (*Object, *BaseException) {
@@ -289,6 +328,85 @@ func listNE(f *Frame, v, w *Object) (*Object, *BaseException) {
 	return listCompare(f, toListUnsafe(v), w, NE)
 }
 
+func listIndex(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+	expectedTypes := []*Type{ListType, ObjectType, ObjectType, ObjectType}
+	argc := len(args)
+	var raised *BaseException
+	if argc == 2 || argc == 3 {
+		expectedTypes = expectedTypes[:argc]
+	}
+	if raised = checkMethodArgs(f, "index", args, expectedTypes...); raised != nil {
+		return nil, raised
+	}
+	l := toListUnsafe(args[0])
+	l.mutex.RLock()
+	numElems := len(l.elems)
+	start, stop := 0, numElems
+	if argc > 2 {
+		start, raised = IndexInt(f, args[2])
+		if raised != nil {
+			l.mutex.RUnlock()
+			return nil, raised
+		}
+	}
+	if argc > 3 {
+		stop, raised = IndexInt(f, args[3])
+		if raised != nil {
+			l.mutex.RUnlock()
+			return nil, raised
+		}
+	}
+	start, stop = adjustIndex(start, stop, numElems)
+	value := args[1]
+	index := -1
+	if start < numElems && start < stop {
+		index, raised = seqFindElem(f, l.elems[start:stop], value)
+	}
+	l.mutex.RUnlock()
+	if raised != nil {
+		return nil, raised
+	}
+	if index == -1 {
+		return nil, f.RaiseType(ValueErrorType, fmt.Sprintf("%v is not in list", value))
+	}
+	return NewInt(index + start).ToObject(), nil
+}
+
+func listPop(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+	argc := len(args)
+	expectedTypes := []*Type{ListType, ObjectType}
+	if argc == 1 {
+		expectedTypes = expectedTypes[:1]
+	}
+	if raised := checkMethodArgs(f, "pop", args, expectedTypes...); raised != nil {
+		return nil, raised
+	}
+	i := -1
+	if argc == 2 {
+		var raised *BaseException
+		i, raised = ToIntValue(f, args[1])
+		if raised != nil {
+			return nil, raised
+		}
+	}
+	l := toListUnsafe(args[0])
+	l.mutex.Lock()
+	numElems := len(l.elems)
+	if i < 0 {
+		i += numElems
+	}
+	var item *Object
+	var raised *BaseException
+	if i >= numElems || i < 0 {
+		raised = f.RaiseType(IndexErrorType, "list index out of range")
+	} else {
+		item = l.elems[i]
+		l.elems = append(l.elems[:i], l.elems[i+1:]...)
+	}
+	l.mutex.Unlock()
+	return item, raised
+}
+
 func listRepr(f *Frame, o *Object) (*Object, *BaseException) {
 	l := toListUnsafe(o)
 	if f.reprEnter(l.ToObject()) {
@@ -334,10 +452,26 @@ func listSetItem(f *Frame, o, key, value *Object) *BaseException {
 	return f.RaiseType(TypeErrorType, fmt.Sprintf("list indices must be integers, not %s", key.Type().Name()))
 }
 
+func listSort(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+	// TODO: Support (cmp=None, key=None, reverse=False)
+	if raised := checkMethodArgs(f, "sort", args, ListType); raised != nil {
+		return nil, raised
+	}
+	l := toListUnsafe(args[0])
+	l.Sort(f)
+	return None, nil
+}
+
 func initListType(dict map[string]*Object) {
 	dict["append"] = newBuiltinFunction("append", listAppend).ToObject()
+	dict["count"] = newBuiltinFunction("count", listCount).ToObject()
+	dict["extend"] = newBuiltinFunction("extend", listExtend).ToObject()
+	dict["index"] = newBuiltinFunction("index", listIndex).ToObject()
 	dict["insert"] = newBuiltinFunction("insert", listInsert).ToObject()
+	dict["pop"] = newBuiltinFunction("pop", listPop).ToObject()
+	dict["remove"] = newBuiltinFunction("remove", listRemove).ToObject()
 	dict["reverse"] = newBuiltinFunction("reverse", listReverse).ToObject()
+	dict["sort"] = newBuiltinFunction("sort", listSort).ToObject()
 	ListType.slots.Add = &binaryOpSlot{listAdd}
 	ListType.slots.Contains = &binaryOpSlot{listContains}
 	ListType.slots.Eq = &binaryOpSlot{listEq}

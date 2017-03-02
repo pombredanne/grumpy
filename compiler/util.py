@@ -16,14 +16,24 @@
 
 """Utilities for generating Go code."""
 
+from __future__ import unicode_literals
+
+import codecs
 import contextlib
 import cStringIO
 import string
+import StringIO
 import textwrap
 
 
-_SIMPLE_CHARS = set(string.digits + string.letters + string.punctuation)
-_ESCAPES = {'\t': r'\t', '\r': r'\r', '\n': r'\n', '"': r'\"'}
+_SIMPLE_CHARS = set(string.digits + string.letters + string.punctuation + " ")
+_ESCAPES = {'\t': r'\t', '\r': r'\r', '\n': r'\n', '"': r'\"', '\\': r'\\'}
+
+
+# This is the max length of a direct allocation tuple supported by the runtime.
+# This should match the number of specializations found in
+# runtime/tuple_direct.go.
+MAX_DIRECT_TUPLE = 6
 
 
 class ParseError(Exception):
@@ -38,8 +48,11 @@ class Writer(object):
   """Utility class for writing blocks of Go code to a file-like object."""
 
   def __init__(self, out=None):
-    self.out = out or cStringIO.StringIO()
+    self.out = codecs.getwriter('utf8')(out or cStringIO.StringIO())
     self.indent_level = 0
+
+  def getvalue(self):
+    return self.out.getvalue().decode('utf8')
 
   @contextlib.contextmanager
   def indent_block(self, n=1):
@@ -51,9 +64,7 @@ class Writer(object):
   def write(self, output):
     for line in output.split('\n'):
       if line:
-        self.out.write('\t' * self.indent_level)
-        self.out.write(line)
-        self.out.write('\n')
+        self.out.write(''.join(('\t' * self.indent_level, line, '\n')))
 
   def write_block(self, block_, body):
     """Outputs the boilerplate necessary for code blocks like functions.
@@ -123,7 +134,7 @@ class Writer(object):
 
 def go_str(value):
   """Returns value as a valid Go string literal."""
-  io = cStringIO.StringIO()
+  io = StringIO.StringIO()
   io.write('"')
   for c in value:
     if c in _ESCAPES:

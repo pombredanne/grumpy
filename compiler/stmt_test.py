@@ -16,11 +16,15 @@
 
 """Tests for StatementVisitor."""
 
-import ast
+from __future__ import unicode_literals
+
 import re
 import subprocess
 import textwrap
 import unittest
+
+import pythonparser
+from pythonparser import ast
 
 from grumpy.compiler import block
 from grumpy.compiler import shard_test
@@ -202,6 +206,36 @@ class StatementVisitorTest(unittest.TestCase):
         else:
           print 'bar'""")))
 
+  def testForElseBreakNotNested(self):
+    self.assertRaisesRegexp(
+        util.ParseError, "'continue' not in loop",
+        _ParseAndVisit, 'for i in (1,):\n  pass\nelse:\n  continue')
+
+  def testForElseContinueNotNested(self):
+    self.assertRaisesRegexp(
+        util.ParseError, "'continue' not in loop",
+        _ParseAndVisit, 'for i in (1,):\n  pass\nelse:\n  continue')
+
+  def testFunctionDecorator(self):
+    self.assertEqual((0, '<b>foo</b>\n'), _GrumpRun(textwrap.dedent("""\
+        def bold(fn):
+          return lambda: '<b>' + fn() + '</b>'
+        @bold
+        def foo():
+          return 'foo'
+        print foo()""")))
+
+  def testFunctionDecoratorWithArg(self):
+    self.assertEqual((0, '<b id=red>foo</b>\n'), _GrumpRun(textwrap.dedent("""\
+        def tag(name):
+          def bold(fn):
+            return lambda: '<b id=' + name + '>' + fn() + '</b>'
+          return bold
+        @tag('red')
+        def foo():
+          return 'foo'
+        print foo()""")))
+
   def testFunctionDef(self):
     self.assertEqual((0, 'bar baz\n'), _GrumpRun(textwrap.dedent("""\
         def foo(a, b):
@@ -287,11 +321,113 @@ class StatementVisitorTest(unittest.TestCase):
         from __go__.time import type_Duration as Duration
         print Duration""")))
 
-  def testPrint(self):
+  def testPrintStatement(self):
     self.assertEqual((0, 'abc 123\nfoo bar\n'), _GrumpRun(textwrap.dedent("""\
         print 'abc',
         print '123'
         print 'foo', 'bar'""")))
+
+  def testImportFromFuture(self):
+    testcases = [
+        ('from __future__ import print_function', stmt.FUTURE_PRINT_FUNCTION),
+        ('from __future__ import generators', 0),
+        ('from __future__ import generators, print_function',
+         stmt.FUTURE_PRINT_FUNCTION),
+    ]
+
+    for i, tc in enumerate(testcases):
+      source, want_flags = tc
+      mod = pythonparser.parse(textwrap.dedent(source))
+      node = mod.body[0]
+      got = stmt.import_from_future(node)
+      msg = '#{}: want {}, got {}'.format(i, want_flags, got)
+      self.assertEqual(want_flags, got, msg=msg)
+
+  def testImportFromFutureParseError(self):
+    testcases = [
+        # NOTE: move this group to testImportFromFuture as they are implemented
+        # by grumpy
+        ('from __future__ import absolute_import',
+         r'future feature \w+ not yet implemented'),
+        ('from __future__ import division',
+         r'future feature \w+ not yet implemented'),
+        ('from __future__ import unicode_literals',
+         r'future feature \w+ not yet implemented'),
+
+        ('from __future__ import braces', 'not a chance'),
+        ('from __future__ import nonexistant_feature',
+         r'future feature \w+ is not defined'),
+    ]
+
+    for tc in testcases:
+      source, want_regexp = tc
+      mod = pythonparser.parse(source)
+      node = mod.body[0]
+      self.assertRaisesRegexp(util.ParseError, want_regexp,
+                              stmt.import_from_future, node)
+
+  def testImportWildcardMemberRaises(self):
+    regexp = r'wildcard member import is not implemented: from foo import *'
+    self.assertRaisesRegexp(util.ParseError, regexp, _ParseAndVisit,
+                            'from foo import *')
+    regexp = (r'wildcard member import is not '
+              r'implemented: from __go__.foo import *')
+    self.assertRaisesRegexp(util.ParseError, regexp, _ParseAndVisit,
+                            'from __go__.foo import *')
+
+  def testVisitFuture(self):
+    testcases = [
+        ('from __future__ import print_function',
+         stmt.FUTURE_PRINT_FUNCTION, 1),
+        ("""\
+        "module docstring"
+
+        from __future__ import print_function
+        """, stmt.FUTURE_PRINT_FUNCTION, 3),
+        ("""\
+        "module docstring"
+
+        from __future__ import print_function, with_statement
+        from __future__ import nested_scopes
+        """, stmt.FUTURE_PRINT_FUNCTION, 4),
+    ]
+
+    for tc in testcases:
+      source, flags, lineno = tc
+      mod = pythonparser.parse(textwrap.dedent(source))
+      future_features = stmt.visit_future(mod)
+      self.assertEqual(future_features.parser_flags, flags)
+      self.assertEqual(future_features.future_lineno, lineno)
+
+  def testVisitFutureParseError(self):
+    testcases = [
+        # future after normal imports
+        """\
+        import os
+        from __future__ import print_function
+        """,
+        # future after non-docstring expression
+        """
+        asd = 123
+        from __future__ import print_function
+        """
+    ]
+
+    for source in testcases:
+      mod = pythonparser.parse(textwrap.dedent(source))
+      self.assertRaisesRegexp(util.ParseError, stmt.late_future,
+                              stmt.visit_future, mod)
+
+  def testFutureFeaturePrintFunction(self):
+    want = "abc\n123\nabc 123\nabcx123\nabc 123 "
+    self.assertEqual((0, want), _GrumpRun(textwrap.dedent("""\
+        "module docstring is ok to proceed __future__"
+        from __future__ import print_function
+        print('abc')
+        print(123)
+        print('abc', 123)
+        print('abc', 123, sep='x')
+        print('abc', 123, end=' ')""")))
 
   def testRaiseExitStatus(self):
     self.assertEqual(1, _GrumpRun('raise Exception')[0])
@@ -441,7 +577,7 @@ class StatementVisitorTest(unittest.TestCase):
         'exc', 'tb', handlers), [1, 2])
     expected = re.compile(r'ResolveGlobal\(.*foo.*\bIsInstance\(.*'
                           r'goto Label1.*goto Label2', re.DOTALL)
-    self.assertRegexpMatches(visitor.writer.out.getvalue(), expected)
+    self.assertRegexpMatches(visitor.writer.getvalue(), expected)
 
   def testWriteExceptDispatcherBareExceptionNotLast(self):
     visitor = stmt.StatementVisitor(_MakeModuleBlock())
@@ -461,18 +597,21 @@ class StatementVisitorTest(unittest.TestCase):
         r'ResolveGlobal\(.*foo.*\bif .*\bIsInstance\(.*\{.*goto Label1.*'
         r'ResolveGlobal\(.*bar.*\bif .*\bIsInstance\(.*\{.*goto Label2.*'
         r'\bRaise\(exc\.ToObject\(\), nil, tb\.ToObject\(\)\)', re.DOTALL)
-    self.assertRegexpMatches(visitor.writer.out.getvalue(), expected)
+    self.assertRegexpMatches(visitor.writer.getvalue(), expected)
 
 
 def _MakeModuleBlock():
-  return block.ModuleBlock('__main__', 'grumpy', 'grumpy/lib', '<test>', [])
+  return block.ModuleBlock('__main__', 'grumpy', 'grumpy/lib', '<test>', '',
+                           stmt.FutureFeatures())
 
 
 def _ParseAndVisit(source):
+  mod = pythonparser.parse(source)
+  future_features = stmt.visit_future(mod)
   b = block.ModuleBlock('__main__', 'grumpy', 'grumpy/lib', '<test>',
-                        source.split('\n'))
+                        source, future_features)
   visitor = stmt.StatementVisitor(b)
-  visitor.visit(ast.parse(source))
+  visitor.visit(mod)
   return visitor
 
 

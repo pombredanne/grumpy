@@ -24,10 +24,11 @@ import (
 
 var (
 	// DictType is the object representing the Python 'dict' type.
-	DictType             = newBasisType("dict", reflect.TypeOf(Dict{}), toDictUnsafe, ObjectType)
-	dictItemIteratorType = newBasisType("dictionary-itemiterator", reflect.TypeOf(dictItemIterator{}), toDictItemIteratorUnsafe, ObjectType)
-	dictKeyIteratorType  = newBasisType("dictionary-keyiterator", reflect.TypeOf(dictKeyIterator{}), toDictKeyIteratorUnsafe, ObjectType)
-	deletedEntry         = &dictEntry{}
+	DictType              = newBasisType("dict", reflect.TypeOf(Dict{}), toDictUnsafe, ObjectType)
+	dictItemIteratorType  = newBasisType("dictionary-itemiterator", reflect.TypeOf(dictItemIterator{}), toDictItemIteratorUnsafe, ObjectType)
+	dictKeyIteratorType   = newBasisType("dictionary-keyiterator", reflect.TypeOf(dictKeyIterator{}), toDictKeyIteratorUnsafe, ObjectType)
+	dictValueIteratorType = newBasisType("dictionary-valueiterator", reflect.TypeOf(dictValueIterator{}), toDictValueIteratorUnsafe, ObjectType)
+	deletedEntry          = &dictEntry{}
 )
 
 const (
@@ -65,11 +66,18 @@ type dictTable struct {
 // newDictTable allocates a table where at least minCapacity entries can be
 // accommodated. minCapacity must be <= maxDictSize.
 func newDictTable(minCapacity int) *dictTable {
-	numEntries := minDictSize
-	for numEntries < minCapacity {
-		numEntries <<= 1
-	}
-	return &dictTable{entries: make([]*dictEntry, numEntries)}
+	// This takes the given capacity and sets all bits less than the highest bit.
+	// Adding 1 to that value causes the number to become a multiple of 2 again.
+	// The minDictSize is mixed in to make sure the resulting value is at least
+	// that big. This implementation makes the function able to be inlined, as
+	// well as allows for complete evaluation of constants at compile time.
+	numEntries := (minDictSize - 1) | minCapacity
+	numEntries |= numEntries >> 1
+	numEntries |= numEntries >> 2
+	numEntries |= numEntries >> 4
+	numEntries |= numEntries >> 8
+	numEntries |= numEntries >> 16
+	return &dictTable{entries: make([]*dictEntry, numEntries+1)}
 }
 
 // loadEntry atomically loads the i'th entry in t and returns it.
@@ -208,8 +216,8 @@ type dictEntryIterator struct {
 
 // newDictEntryIterator creates a dictEntryIterator object for d. It assumes
 // that d.mutex is held by the caller.
-func newDictEntryIterator(d *Dict) *dictEntryIterator {
-	return &dictEntryIterator{table: d.loadTable()}
+func newDictEntryIterator(d *Dict) dictEntryIterator {
+	return dictEntryIterator{table: d.loadTable()}
 }
 
 // next advances this iterator to the next occupied entry and returns it. The
@@ -241,8 +249,8 @@ type dictVersionGuard struct {
 	version int64
 }
 
-func newDictVersionGuard(d *Dict) *dictVersionGuard {
-	return &dictVersionGuard{d, d.loadVersion()}
+func newDictVersionGuard(d *Dict) dictVersionGuard {
+	return dictVersionGuard{d, d.loadVersion()}
 }
 
 // check returns false if the dict held by g has changed since g was created,
@@ -318,25 +326,11 @@ func (d *Dict) incVersion() {
 // DelItem removes the entry associated with key from d. It returns true if an
 // item was removed, or false if it did not exist in d.
 func (d *Dict) DelItem(f *Frame, key *Object) (bool, *BaseException) {
-	hash, raised := Hash(f, key)
+	originValue, raised := d.putItem(f, key, nil)
 	if raised != nil {
 		return false, raised
 	}
-	deleted := false
-	d.mutex.Lock(f)
-	v := d.version
-	if index, entry, raised := d.table.lookupEntry(f, hash.Value(), key); raised == nil {
-		if v != d.version {
-			raised = f.RaiseType(RuntimeErrorType, "dictionary changed during write")
-		} else if entry != nil && entry != deletedEntry {
-			d.table.storeEntry(index, deletedEntry)
-			d.table.incUsed(-1)
-			d.incVersion()
-			deleted = true
-		}
-	}
-	d.mutex.Unlock(f)
-	return deleted, raised
+	return originValue != nil, nil
 }
 
 // DelItemString removes the entry associated with key from d. It returns true
@@ -368,6 +362,12 @@ func (d *Dict) GetItemString(f *Frame, key string) (*Object, *BaseException) {
 	return d.GetItem(f, NewStr(key).ToObject())
 }
 
+// Pop looks up key in d, returning and removing the associalted value if exist,
+// or nil if key is not present in d.
+func (d *Dict) Pop(f *Frame, key *Object) (*Object, *BaseException) {
+	return d.putItem(f, key, nil)
+}
+
 // Keys returns a list containing all the keys in d.
 func (d *Dict) Keys(f *Frame) *List {
 	d.mutex.Lock(f)
@@ -388,38 +388,49 @@ func (d *Dict) Len() int {
 	return d.loadTable().loadUsed()
 }
 
-// putItem associates value with key in d, returning true if the key was added
-// (i.e. it was not already present in d).
-func (d *Dict) putItem(f *Frame, key, value *Object) (bool, *BaseException) {
+// putItem associates value with key in d, returning the old associated value if
+// the key was added, or nil if it was not already present in d.
+func (d *Dict) putItem(f *Frame, key, value *Object) (*Object, *BaseException) {
 	hash, raised := Hash(f, key)
 	if raised != nil {
-		return false, raised
+		return nil, raised
 	}
 	d.mutex.Lock(f)
 	t := d.table
 	v := d.version
 	index, entry, raised := t.lookupEntry(f, hash.Value(), key)
-	added := false
+	var originValue *Object
 	if raised == nil {
 		if v != d.version {
 			// Dictionary was recursively modified. Blow up instead
 			// of trying to recover.
 			raised = f.RaiseType(RuntimeErrorType, "dictionary changed during write")
 		} else {
-			if newTable, ok := t.writeEntry(f, index, &dictEntry{hash.Value(), key, value}); ok {
-				if newTable != nil {
-					d.storeTable(newTable)
+			if value == nil {
+				// Going to delete the entry.
+				if entry != nil && entry != deletedEntry {
+					d.table.storeEntry(index, deletedEntry)
+					d.table.incUsed(-1)
+					d.incVersion()
 				}
-				d.incVersion()
-				// Key absent if entry == nil or deletedEntry.
-				added = entry == nil || entry == deletedEntry
 			} else {
-				raised = f.RaiseType(OverflowErrorType, errResultTooLarge)
+				newEntry := &dictEntry{hash.Value(), key, value}
+				if newTable, ok := t.writeEntry(f, index, newEntry); ok {
+					if newTable != nil {
+						d.storeTable(newTable)
+					}
+					d.incVersion()
+				} else {
+					raised = f.RaiseType(OverflowErrorType, errResultTooLarge)
+				}
+			}
+			if entry != nil && entry != deletedEntry {
+				originValue = entry.value
 			}
 		}
 	}
 	d.mutex.Unlock(f)
-	return added, raised
+	return originValue, raised
 }
 
 // SetItem associates value with key in d.
@@ -508,6 +519,18 @@ func dictsAreEqual(f *Frame, d1, d2 *Dict) (bool, *BaseException) {
 	return result, nil
 }
 
+func dictClear(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+	if raised := checkMethodArgs(f, "clear", args, DictType); raised != nil {
+		return nil, raised
+	}
+	d := toDictUnsafe(args[0])
+	d.mutex.Lock(f)
+	d.table = newDictTable(0)
+	d.incVersion()
+	d.mutex.Unlock(f)
+	return None, nil
+}
+
 func dictContains(f *Frame, seq, value *Object) (*Object, *BaseException) {
 	item, raised := toDictUnsafe(seq).GetItem(f, value)
 	if raised != nil {
@@ -557,6 +580,13 @@ func dictGet(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
 	return item, raised
 }
 
+func dictHasKey(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+	if raised := checkMethodArgs(f, "has_key", args, DictType, ObjectType); raised != nil {
+		return nil, raised
+	}
+	return dictContains(f, args[0], args[1])
+}
+
 func dictItems(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
 	if raised := checkMethodArgs(f, "items", args, DictType); raised != nil {
 		return nil, raised
@@ -579,11 +609,51 @@ func dictIterItems(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException)
 	return iter, nil
 }
 
+func dictIterKeys(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
+	if raised := checkMethodArgs(f, "iterkeys", args, DictType); raised != nil {
+		return nil, raised
+	}
+	return dictIter(f, args[0])
+}
+
+func dictIterValues(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
+	if raised := checkMethodArgs(f, "itervalues", args, DictType); raised != nil {
+		return nil, raised
+	}
+	d := toDictUnsafe(args[0])
+	d.mutex.Lock(f)
+	iter := newDictValueIterator(d).ToObject()
+	d.mutex.Unlock(f)
+	return iter, nil
+}
+
 func dictKeys(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
 	if raised := checkMethodArgs(f, "keys", args, DictType); raised != nil {
 		return nil, raised
 	}
 	return toDictUnsafe(args[0]).Keys(f).ToObject(), nil
+}
+
+func dictPop(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+	expectedTypes := []*Type{DictType, ObjectType, ObjectType}
+	argc := len(args)
+	if argc == 2 {
+		expectedTypes = expectedTypes[:2]
+	}
+	if raised := checkMethodArgs(f, "pop", args, expectedTypes...); raised != nil {
+		return nil, raised
+	}
+	key := args[1]
+	d := toDictUnsafe(args[0])
+	item, raised := d.Pop(f, key)
+	if raised == nil && item == nil {
+		if argc > 2 {
+			item = args[2]
+		} else {
+			raised = raiseKeyError(f, key)
+		}
+	}
+	return item, raised
 }
 
 func dictGetItem(f *Frame, o, key *Object) (*Object, *BaseException) {
@@ -635,7 +705,7 @@ func dictLen(f *Frame, o *Object) (*Object, *BaseException) {
 }
 
 func dictNE(f *Frame, v, w *Object) (*Object, *BaseException) {
-	if !v.isInstance(DictType) {
+	if !w.isInstance(DictType) {
 		return NotImplemented, nil
 	}
 	eq, raised := dictsAreEqual(f, toDictUnsafe(v), toDictUnsafe(w))
@@ -712,12 +782,29 @@ func dictUpdate(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
 	return None, nil
 }
 
+func dictValues(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
+	if raised := checkMethodArgs(f, "values", args, DictType); raised != nil {
+		return nil, raised
+	}
+	iter, raised := dictIterValues(f, args, nil)
+	if raised != nil {
+		return nil, raised
+	}
+	return ListType.Call(f, Args{iter}, nil)
+}
+
 func initDictType(dict map[string]*Object) {
+	dict["clear"] = newBuiltinFunction("clear", dictClear).ToObject()
 	dict["get"] = newBuiltinFunction("get", dictGet).ToObject()
+	dict["has_key"] = newBuiltinFunction("has_key", dictHasKey).ToObject()
 	dict["items"] = newBuiltinFunction("items", dictItems).ToObject()
 	dict["iteritems"] = newBuiltinFunction("iteritems", dictIterItems).ToObject()
+	dict["iterkeys"] = newBuiltinFunction("iterkeys", dictIterKeys).ToObject()
+	dict["itervalues"] = newBuiltinFunction("itervalues", dictIterValues).ToObject()
 	dict["keys"] = newBuiltinFunction("keys", dictKeys).ToObject()
+	dict["pop"] = newBuiltinFunction("pop", dictPop).ToObject()
 	dict["update"] = newBuiltinFunction("update", dictUpdate).ToObject()
+	dict["values"] = newBuiltinFunction("values", dictValues).ToObject()
 	DictType.slots.Contains = &binaryOpSlot{dictContains}
 	DictType.slots.DelItem = &delItemSlot{dictDelItem}
 	DictType.slots.Eq = &binaryOpSlot{dictEq}
@@ -734,8 +821,8 @@ func initDictType(dict map[string]*Object) {
 
 type dictItemIterator struct {
 	Object
-	iter  *dictEntryIterator
-	guard *dictVersionGuard
+	iter  dictEntryIterator
+	guard dictVersionGuard
 }
 
 // newDictItemIterator creates a dictItemIterator object for d. It assumes that
@@ -762,11 +849,11 @@ func dictItemIteratorIter(f *Frame, o *Object) (*Object, *BaseException) {
 
 func dictItemIteratorNext(f *Frame, o *Object) (ret *Object, raised *BaseException) {
 	iter := toDictItemIteratorUnsafe(o)
-	entry, raised := dictIteratorNext(f, iter.iter, iter.guard)
+	entry, raised := dictIteratorNext(f, &iter.iter, &iter.guard)
 	if raised != nil {
 		return nil, raised
 	}
-	return NewTuple(entry.key, entry.value).ToObject(), nil
+	return NewTuple2(entry.key, entry.value).ToObject(), nil
 }
 
 func initDictItemIteratorType(map[string]*Object) {
@@ -777,8 +864,8 @@ func initDictItemIteratorType(map[string]*Object) {
 
 type dictKeyIterator struct {
 	Object
-	iter  *dictEntryIterator
-	guard *dictVersionGuard
+	iter  dictEntryIterator
+	guard dictVersionGuard
 }
 
 // newDictKeyIterator creates a dictKeyIterator object for d. It assumes that
@@ -805,7 +892,7 @@ func dictKeyIteratorIter(f *Frame, o *Object) (*Object, *BaseException) {
 
 func dictKeyIteratorNext(f *Frame, o *Object) (*Object, *BaseException) {
 	iter := toDictKeyIteratorUnsafe(o)
-	entry, raised := dictIteratorNext(f, iter.iter, iter.guard)
+	entry, raised := dictIteratorNext(f, &iter.iter, &iter.guard)
 	if raised != nil {
 		return nil, raised
 	}
@@ -816,6 +903,49 @@ func initDictKeyIteratorType(map[string]*Object) {
 	dictKeyIteratorType.flags &^= typeFlagBasetype | typeFlagInstantiable
 	dictKeyIteratorType.slots.Iter = &unaryOpSlot{dictKeyIteratorIter}
 	dictKeyIteratorType.slots.Next = &unaryOpSlot{dictKeyIteratorNext}
+}
+
+type dictValueIterator struct {
+	Object
+	iter  dictEntryIterator
+	guard dictVersionGuard
+}
+
+// newDictValueIterator creates a dictValueIterator object for d. It assumes
+// that d.mutex is held by the caller.
+func newDictValueIterator(d *Dict) *dictValueIterator {
+	return &dictValueIterator{
+		Object: Object{typ: dictValueIteratorType},
+		iter:   newDictEntryIterator(d),
+		guard:  newDictVersionGuard(d),
+	}
+}
+
+func toDictValueIteratorUnsafe(o *Object) *dictValueIterator {
+	return (*dictValueIterator)(o.toPointer())
+}
+
+func (iter *dictValueIterator) ToObject() *Object {
+	return &iter.Object
+}
+
+func dictValueIteratorIter(f *Frame, o *Object) (*Object, *BaseException) {
+	return o, nil
+}
+
+func dictValueIteratorNext(f *Frame, o *Object) (*Object, *BaseException) {
+	iter := toDictValueIteratorUnsafe(o)
+	entry, raised := dictIteratorNext(f, &iter.iter, &iter.guard)
+	if raised != nil {
+		return nil, raised
+	}
+	return entry.value, nil
+}
+
+func initDictValueIteratorType(map[string]*Object) {
+	dictValueIteratorType.flags &^= typeFlagBasetype | typeFlagInstantiable
+	dictValueIteratorType.slots.Iter = &unaryOpSlot{dictValueIteratorIter}
+	dictValueIteratorType.slots.Next = &unaryOpSlot{dictValueIteratorNext}
 }
 
 func raiseKeyError(f *Frame, key *Object) *BaseException {

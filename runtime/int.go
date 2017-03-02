@@ -16,6 +16,7 @@ package grumpy
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"reflect"
 	"strconv"
@@ -101,7 +102,7 @@ func intGetNewArgs(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
 	if raised := checkMethodArgs(f, "__getnewargs__", args, IntType); raised != nil {
 		return nil, raised
 	}
-	return NewTuple(args[0]).ToObject(), nil
+	return NewTuple1(args[0]).ToObject(), nil
 }
 
 func intGT(f *Frame, v, w *Object) (*Object, *BaseException) {
@@ -115,6 +116,11 @@ func intFloat(f *Frame, o *Object) (*Object, *BaseException) {
 
 func intHash(f *Frame, o *Object) (*Object, *BaseException) {
 	return o, nil
+}
+
+func intHex(f *Frame, o *Object) (*Object, *BaseException) {
+	val := numberToBase("0x", 16, o)
+	return NewStr(val).ToObject(), nil
 }
 
 func intIndex(f *Frame, o *Object) (*Object, *BaseException) {
@@ -179,15 +185,25 @@ func intNew(f *Frame, t *Type, args Args, _ KWArgs) (*Object, *BaseException) {
 	}
 	o := args[0]
 	if len(args) == 1 && o.typ.slots.Int != nil {
-		result, raised := intFromObject(f, o)
-		if result != nil || raised != nil {
-			if t == IntType || raised != nil {
-				return result, raised
-			}
-			o := newObject(t)
-			toIntUnsafe(o).value = toIntUnsafe(result).value
-			return o, nil
+		i, raised := ToInt(f, o)
+		if raised != nil {
+			return nil, raised
 		}
+		if t == IntType {
+			return i, nil
+		}
+		n := 0
+		if i.isInstance(LongType) {
+			n, raised = toLongUnsafe(i).IntValue(f)
+			if raised != nil {
+				return nil, raised
+			}
+		} else {
+			n = toIntUnsafe(i).Value()
+		}
+		ret := newObject(t)
+		toIntUnsafe(ret).value = n
+		return ret, nil
 	}
 	if len(args) > 2 {
 		return nil, f.RaiseType(TypeErrorType, fmt.Sprintf("int() takes at most 2 arguments (%d given)", len(args)))
@@ -201,14 +217,11 @@ func intNew(f *Frame, t *Type, args Args, _ KWArgs) (*Object, *BaseException) {
 	s := toStrUnsafe(o).Value()
 	base := 10
 	if len(args) == 2 {
-		if args[1].typ.slots.Int == nil {
-			return nil, f.RaiseType(TypeErrorType, "an integer is required")
-		}
-		baseArg, raised := intFromObject(f, args[1])
+		var raised *BaseException
+		base, raised = ToIntValue(f, args[1])
 		if raised != nil {
 			return nil, raised
 		}
-		base = toIntUnsafe(baseArg).Value()
 		if base < 0 || base == 1 || base > 36 {
 			return nil, f.RaiseType(ValueErrorType, "int() base must be >= 2 and <= 36")
 		}
@@ -236,11 +249,60 @@ func intNonZero(f *Frame, o *Object) (*Object, *BaseException) {
 	return GetBool(toIntUnsafe(o).Value() != 0).ToObject(), nil
 }
 
+func intOct(f *Frame, o *Object) (*Object, *BaseException) {
+	val := numberToBase("0", 8, o)
+	if val == "00" {
+		val = "0"
+	}
+	return NewStr(val).ToObject(), nil
+}
+
 func intOr(f *Frame, v, w *Object) (*Object, *BaseException) {
 	if !w.isInstance(IntType) {
 		return NotImplemented, nil
 	}
 	return NewInt(toIntUnsafe(v).Value() | toIntUnsafe(w).Value()).ToObject(), nil
+}
+
+func intPos(f *Frame, o *Object) (*Object, *BaseException) {
+	return o, nil
+}
+
+func intPow(f *Frame, v, w *Object) (*Object, *BaseException) {
+	if w.isInstance(IntType) {
+		// First try to use the faster floating point arithmetic
+		// on the CPU, then falls back to slower methods.
+		// IEEE float64 has 52bit of precision, so the result should be
+		// less than MaxInt32 to be representable as an exact integer.
+		// This assumes that int is at least 32bit.
+		vInt := toIntUnsafe(v).Value()
+		wInt := toIntUnsafe(w).Value()
+		if 0 < vInt && vInt <= math.MaxInt32 && 0 < wInt && wInt <= math.MaxInt32 {
+			res := math.Pow(float64(vInt), float64(wInt))
+			// Can the result be interpreted as an int?
+			if !math.IsNaN(res) && !math.IsInf(res, 0) && res <= math.MaxInt32 {
+				return NewInt(int(res)).ToObject(), nil
+			}
+		}
+		// Special cases.
+		if vInt == 0 {
+			if wInt < 0 {
+				return nil, f.RaiseType(ZeroDivisionErrorType, "0.0 cannot be raised to a negative power")
+			}
+			if wInt == 0 {
+				return NewInt(1).ToObject(), nil
+			}
+			return NewInt(0).ToObject(), nil
+		}
+		// If w < 0, the result must be a floating point number.
+		// We convert both arguments to float and continue.
+		if wInt < 0 {
+			return floatPow(f, NewFloat(float64(vInt)).ToObject(), NewFloat(float64(wInt)).ToObject())
+		}
+		// Else we convert to Long and continue there.
+		return longPow(f, NewLong(big.NewInt(int64(vInt))).ToObject(), NewLong(big.NewInt(int64(wInt))).ToObject())
+	}
+	return NotImplemented, nil
 }
 
 func intRAdd(f *Frame, v, w *Object) (*Object, *BaseException) {
@@ -313,6 +375,7 @@ func initIntType(dict map[string]*Object) {
 	IntType.slots.GT = &binaryOpSlot{intGT}
 	IntType.slots.Float = &unaryOpSlot{intFloat}
 	IntType.slots.Hash = &unaryOpSlot{intHash}
+	IntType.slots.Hex = &unaryOpSlot{intHex}
 	IntType.slots.Index = &unaryOpSlot{intIndex}
 	IntType.slots.Int = &unaryOpSlot{intInt}
 	IntType.slots.Invert = &unaryOpSlot{intInvert}
@@ -327,7 +390,10 @@ func initIntType(dict map[string]*Object) {
 	IntType.slots.Neg = &unaryOpSlot{intNeg}
 	IntType.slots.New = &newSlot{intNew}
 	IntType.slots.NonZero = &unaryOpSlot{intNonZero}
+	IntType.slots.Oct = &unaryOpSlot{intOct}
 	IntType.slots.Or = &binaryOpSlot{intOr}
+	IntType.slots.Pos = &unaryOpSlot{intPos}
+	IntType.slots.Pow = &binaryOpSlot{intPow}
 	IntType.slots.RAdd = &binaryOpSlot{intRAdd}
 	IntType.slots.RAnd = &binaryOpSlot{intAnd}
 	IntType.slots.RDiv = &binaryOpSlot{intRDiv}
@@ -489,22 +555,6 @@ func intShiftOp(f *Frame, v, w *Object, fun func(int, int) (int, int, bool)) (*O
 		}
 	}
 	return NewInt(result).ToObject(), nil
-}
-
-func intFromObject(f *Frame, o *Object) (*Object, *BaseException) {
-	if o.typ.slots.Int == nil {
-		return nil, nil
-	}
-	r, raised := o.typ.slots.Int.Fn(f, o)
-	switch {
-	case raised != nil:
-		return nil, raised
-	case r.isInstance(IntType) || r.isInstance(LongType):
-		return r, nil
-	default:
-		format := "__int__ returned non-int (type %s)"
-		return nil, f.RaiseType(TypeErrorType, fmt.Sprintf(format, r.typ.Name()))
-	}
 }
 
 func intToLong(o *Int) *Long {

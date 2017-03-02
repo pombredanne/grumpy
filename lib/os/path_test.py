@@ -22,6 +22,24 @@ import weetest
 import tempfile
 
 
+def _AssertEqual(a, b):
+  assert a == b
+  assert type(a) is type(b)
+
+
+def TestAbspath():
+  _AssertEqual(path.abspath('/a/b/c'), '/a/b/c')
+  _AssertEqual(path.abspath(u'/a/b/c'), u'/a/b/c')
+  _AssertEqual(path.abspath('/a/b/c/'), '/a/b/c')
+  _AssertEqual(path.abspath(u'/a/b/c/'), u'/a/b/c')
+  _AssertEqual(path.abspath('a/b/c'), path.normpath(os.getcwd() + '/a/b/c'))
+
+
+def TestBasename():
+  assert path.basename('/a/b/c') == 'c'
+  assert path.basename('/a/b/c/') == ''
+
+
 def TestDirname():
   assert path.dirname('/a/b/c') == '/a/b'
   assert path.dirname('/a/b/c/') == '/a/b/c'
@@ -85,16 +103,25 @@ def TestJoin():
 
 
 def TestNormPath():
-  assert path.normpath('abc/') == 'abc'
-  assert path.normpath('/a//b') == '/a/b'
-  assert path.normpath('abc/../123') == '123'
-  assert path.normpath('../abc/123') == '../abc/123'
-  assert path.normpath('x/y/./z') == 'x/y/z'
-  assert path.normpath(u'abc/') == u'abc'
-  assert path.normpath(u'/a//b') == u'/a/b'
-  assert path.normpath(u'abc/../123') == u'123'
-  assert path.normpath(u'../abc/123') == u'../abc/123'
-  assert path.normpath(u'x/y/./z') == u'x/y/z'
+  _AssertEqual(path.normpath('abc/'), 'abc')
+  _AssertEqual(path.normpath('/a//b'), '/a/b')
+  _AssertEqual(path.normpath('abc/../123'), '123')
+  _AssertEqual(path.normpath('../abc/123'), '../abc/123')
+  _AssertEqual(path.normpath('x/y/./z'), 'x/y/z')
+  _AssertEqual(path.normpath(u'abc/'), u'abc')
+  _AssertEqual(path.normpath(u'/a//b'), u'/a/b')
+  _AssertEqual(path.normpath(u'abc/../123'), u'123')
+  _AssertEqual(path.normpath(u'../abc/123'), u'../abc/123')
+  _AssertEqual(path.normpath(u'x/y/./z'), u'x/y/z')
+
+
+def TestSplit():
+  assert path.split('a/b') == ('a', 'b')
+  assert path.split('a/b/') == ('a/b', '')
+  assert path.split('a/') == ('a', '')
+  assert path.split('a') == ('', 'a')
+  assert path.split('/') == ('/', '')
+  assert path.split('/a/./b') == ('/a/.', 'b')
 
 
 if __name__ == '__main__':

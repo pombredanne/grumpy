@@ -374,6 +374,7 @@ type typeSlots struct {
 	And          *binaryOpSlot
 	Basis        *basisSlot
 	Call         *callSlot
+	Cmp          *binaryOpSlot
 	Contains     *binaryOpSlot
 	DelAttr      *delAttrSlot
 	Delete       *deleteSlot
@@ -387,9 +388,11 @@ type typeSlots struct {
 	GetItem      *binaryOpSlot
 	GT           *binaryOpSlot
 	Hash         *unaryOpSlot
+	Hex          *unaryOpSlot
 	IAdd         *binaryOpSlot
 	IAnd         *binaryOpSlot
 	IDiv         *binaryOpSlot
+	ILShift      *binaryOpSlot
 	IMod         *binaryOpSlot
 	IMul         *binaryOpSlot
 	Index        *unaryOpSlot
@@ -397,6 +400,8 @@ type typeSlots struct {
 	Int          *unaryOpSlot
 	Invert       *unaryOpSlot
 	IOr          *binaryOpSlot
+	IPow         *binaryOpSlot
+	IRShift      *binaryOpSlot
 	ISub         *binaryOpSlot
 	Iter         *unaryOpSlot
 	IXor         *binaryOpSlot
@@ -413,7 +418,10 @@ type typeSlots struct {
 	New          *newSlot
 	Next         *unaryOpSlot
 	NonZero      *unaryOpSlot
+	Oct          *unaryOpSlot
 	Or           *binaryOpSlot
+	Pos          *unaryOpSlot
+	Pow          *binaryOpSlot
 	RAdd         *binaryOpSlot
 	RAnd         *binaryOpSlot
 	RDiv         *binaryOpSlot
@@ -422,6 +430,7 @@ type typeSlots struct {
 	RMod         *binaryOpSlot
 	RMul         *binaryOpSlot
 	ROr          *binaryOpSlot
+	RPow         *binaryOpSlot
 	RRShift      *binaryOpSlot
 	RShift       *binaryOpSlot
 	RSub         *binaryOpSlot
