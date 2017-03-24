@@ -27,10 +27,10 @@ from pythonparser import ast
 from grumpy.compiler import block
 from grumpy.compiler import expr
 from grumpy.compiler import expr_visitor
+from grumpy.compiler import imputil
 from grumpy.compiler import util
 
 
-_NATIVE_MODULE_PREFIX = '__go__.'
 _NATIVE_TYPE_PREFIX = 'type_'
 
 # Partial list of known vcs for go module import
@@ -140,19 +140,22 @@ class StatementVisitor(algorithm.Visitor):
 
   def __init__(self, block_):
     self.block = block_
-    self.future_features = self.block.future_features or FutureFeatures()
+    self.future_features = self.block.root.future_features or FutureFeatures()
     self.writer = util.Writer()
-    self.expr_visitor = expr_visitor.ExprVisitor(self.block, self.writer)
+    self.expr_visitor = expr_visitor.ExprVisitor(self)
 
   def generic_visit(self, node):
     msg = 'node not yet implemented: {}'.format(type(node).__name__)
     raise util.ParseError(node, msg)
 
+  def visit_expr(self, node):
+    return self.expr_visitor.visit(node)
+
   def visit_Assert(self, node):
     self._write_py_context(node.lineno)
     # TODO: Only evaluate msg if cond is false.
-    with self.expr_visitor.visit(node.msg) if node.msg else _nil_expr as msg,\
-        self.expr_visitor.visit(node.test) as cond:
+    with self.visit_expr(node.msg) if node.msg else _nil_expr as msg,\
+        self.visit_expr(node.test) as cond:
       self.writer.write_checked_call1(
           'πg.Assert(πF, {}, {})', cond.expr, msg.expr)
 
@@ -162,8 +165,8 @@ class StatementVisitor(algorithm.Visitor):
       fmt = 'augmented assignment op not implemented: {}'
       raise util.ParseError(node, fmt.format(op_type.__name__))
     self._write_py_context(node.lineno)
-    with self.expr_visitor.visit(node.target) as target,\
-        self.expr_visitor.visit(node.value) as value,\
+    with self.visit_expr(node.target) as target,\
+        self.visit_expr(node.value) as value,\
         self.block.alloc_temp() as temp:
       self.writer.write_checked_call2(
           temp, StatementVisitor._AUG_ASSIGN_TEMPLATES[op_type],
@@ -172,7 +175,7 @@ class StatementVisitor(algorithm.Visitor):
 
   def visit_Assign(self, node):
     self._write_py_context(node.lineno)
-    with self.expr_visitor.visit(node.value) as value:
+    with self.visit_expr(node.value) as value:
       for target in node.targets:
         self._tie_target(target, value.expr)
 
@@ -206,21 +209,21 @@ class StatementVisitor(algorithm.Visitor):
       self.writer.write('{} = make([]*πg.Object, {})'.format(
           bases.expr, len(node.bases)))
       for i, b in enumerate(node.bases):
-        with self.expr_visitor.visit(b) as b:
+        with self.visit_expr(b) as b:
           self.writer.write('{}[{}] = {}'.format(bases.expr, i, b.expr))
       self.writer.write('{} = πg.NewDict()'.format(cls.name))
       self.writer.write_checked_call2(
           mod_name, 'πF.Globals().GetItem(πF, {}.ToObject())',
-          self.block.intern('__name__'))
+          self.block.root.intern('__name__'))
       self.writer.write_checked_call1(
           '{}.SetItem(πF, {}.ToObject(), {})',
-          cls.expr, self.block.intern('__module__'), mod_name.expr)
+          cls.expr, self.block.root.intern('__module__'), mod_name.expr)
       tmpl = textwrap.dedent("""
           _, πE = πg.NewCode($name, $filename, nil, 0, func(πF *πg.Frame, _ []*πg.Object) (*πg.Object, *πg.BaseException) {
           \tπClass := $cls
           \t_ = πClass""")
       self.writer.write_tmpl(tmpl, name=util.go_str(node.name),
-                             filename=util.go_str(self.block.filename),
+                             filename=util.go_str(self.block.root.filename),
                              cls=cls.expr)
       with self.writer.indent_block():
         self.writer.write_temp_decls(body_visitor.block)
@@ -237,8 +240,9 @@ class StatementVisitor(algorithm.Visitor):
           if $meta == nil {
           \t$meta = πg.TypeType.ToObject()
           }""")
-      self.writer.write_tmpl(tmpl, meta=meta.name, cls=cls.expr,
-                             metaclass_str=self.block.intern('__metaclass__'))
+      self.writer.write_tmpl(
+          tmpl, meta=meta.name, cls=cls.expr,
+          metaclass_str=self.block.root.intern('__metaclass__'))
       with self.block.alloc_temp() as type_:
         type_expr = ('{}.Call(πF, []*πg.Object{{πg.NewStr({}).ToObject(), '
                      'πg.NewTuple({}...).ToObject(), {}.ToObject()}}, nil)')
@@ -257,14 +261,15 @@ class StatementVisitor(algorithm.Visitor):
     self._write_py_context(node.lineno)
     for target in node.targets:
       if isinstance(target, ast.Attribute):
-        with self.expr_visitor.visit(target.value) as t:
+        with self.visit_expr(target.value) as t:
           self.writer.write_checked_call1(
-              'πg.DelAttr(πF, {}, {})', t.expr, self.block.intern(target.attr))
+              'πg.DelAttr(πF, {}, {})', t.expr,
+              self.block.root.intern(target.attr))
       elif isinstance(target, ast.Name):
         self.block.del_var(self.writer, target.id)
       elif isinstance(target, ast.Subscript):
-        with self.expr_visitor.visit(target.value) as t,\
-            self.expr_visitor.visit(target.slice) as index:
+        with self.visit_expr(target.value) as t,\
+            self.visit_expr(target.slice) as index:
           self.writer.write_checked_call1('πg.DelItem(πF, {}, {})',
                                           t.expr, index.expr)
       else:
@@ -273,13 +278,13 @@ class StatementVisitor(algorithm.Visitor):
 
   def visit_Expr(self, node):
     self._write_py_context(node.lineno)
-    self.expr_visitor.visit(node.value).free()
+    self.visit_expr(node.value).free()
 
   def visit_For(self, node):
     loop = self.block.push_loop()
     orelse_label = self.block.genlabel() if node.orelse else loop.end_label
     self._write_py_context(node.lineno)
-    with self.expr_visitor.visit(node.iter) as iter_expr, \
+    with self.visit_expr(node.iter) as iter_expr, \
         self.block.alloc_temp() as i, \
         self.block.alloc_temp() as n:
       self.writer.write_checked_call2(i, 'πg.Iter(πF, {})', iter_expr.expr)
@@ -313,7 +318,7 @@ class StatementVisitor(algorithm.Visitor):
 
   def visit_FunctionDef(self, node):
     self._write_py_context(node.lineno + len(node.decorator_list))
-    func = self.expr_visitor.visit_function_inline(node)
+    func = self.visit_function_inline(node)
     self.block.bind_var(self.writer, node.name, func.expr)
     while node.decorator_list:
       decorator = node.decorator_list.pop()
@@ -337,7 +342,7 @@ class StatementVisitor(algorithm.Visitor):
     orelse = [node]
     while len(orelse) == 1 and isinstance(orelse[0], ast.If):
       ifnode = orelse[0]
-      with self.expr_visitor.visit(ifnode.test) as cond:
+      with self.visit_expr(ifnode.test) as cond:
         label = self.block.genlabel()
         # We goto the body of the if statement instead of executing it inline
         # because the body itself may be a goto target and Go does not support
@@ -369,58 +374,43 @@ class StatementVisitor(algorithm.Visitor):
 
   def visit_Import(self, node):
     self._write_py_context(node.lineno)
-    for alias in node.names:
-      if alias.name.startswith(_NATIVE_MODULE_PREFIX):
-        raise util.ParseError(
-            node, 'for native imports use "from __go__.xyz import ..." syntax')
-      with self._import(alias.name, 0) as mod:
-        asname = alias.asname or alias.name.split('.')[0]
-        self.block.bind_var(self.writer, asname, mod.expr)
+    visitor = imputil.ImportVisitor(self.block.root.path)
+    visitor.visit(node)
+    for imp in visitor.imports:
+      self._import_and_bind(imp)
 
   def visit_ImportFrom(self, node):
-    # Wildcard imports are not yet supported.
-    for alias in node.names:
-      if alias.name == '*':
-        msg = 'wildcard member import is not implemented: from %s import %s' % (
-            node.module, alias.name)
-        raise util.ParseError(node, msg)
     self._write_py_context(node.lineno)
-    if node.module.startswith(_NATIVE_MODULE_PREFIX):
-      values = [alias.name for alias in node.names]
-      with self._import_native(node.module, values) as mod:
-        for alias in node.names:
-          # Strip the 'type_' prefix when populating the module. This means
-          # that, e.g. 'from __go__.foo import type_Bar' will populate foo with
-          # a member called Bar, not type_Bar (although the symbol in the
-          # importing module will still be type_Bar unless aliased). This bends
-          # the semantics of import but makes native module contents more
-          # sensible.
-          name = alias.name
-          if name.startswith(_NATIVE_TYPE_PREFIX):
-            name = name[len(_NATIVE_TYPE_PREFIX):]
-          with self.block.alloc_temp() as member:
-            self.writer.write_checked_call2(
-                member, 'πg.GetAttr(πF, {}, {}, nil)',
-                mod.expr, self.block.intern(name))
-            self.block.bind_var(
-                self.writer, alias.asname or alias.name, member.expr)
-    elif node.module == '__future__':
-      # At this stage all future imports are done in an initial pass (see
-      # visit() above), so if they are encountered here after the last valid
-      # __future__ then it's a syntax error.
-      if node.lineno > self.future_features.future_lineno:
-        raise util.ParseError(node, late_future)
-    else:
-      # NOTE: Assume that the names being imported are all modules within a
-      # package. E.g. "from a.b import c" is importing the module c from package
-      # a.b, not some member of module b. We cannot distinguish between these
-      # two cases at compile time and the Google style guide forbids the latter
-      # so we support that use case only.
-      for alias in node.names:
-        name = '{}.{}'.format(node.module, alias.name)
-        with self._import(name, name.count('.')) as mod:
-          asname = alias.asname or alias.name
-          self.block.bind_var(self.writer, asname, mod.expr)
+    visitor = imputil.ImportVisitor(self.block.root.path)
+    visitor.visit(node)
+    for imp in visitor.imports:
+      if imp.is_native:
+        values = [b.value for b in imp.bindings]
+        with self._import_native(imp.name, values) as mod:
+          for binding in imp.bindings:
+            # Strip the 'type_' prefix when populating the module. This means
+            # that, e.g. 'from __go__.foo import type_Bar' will populate foo
+            # with a member called Bar, not type_Bar (although the symbol in
+            # the importing module will still be type_Bar unless aliased). This
+            # bends the semantics of import but makes native module contents
+            # more sensible.
+            name = binding.value
+            if name.startswith(_NATIVE_TYPE_PREFIX):
+              name = name[len(_NATIVE_TYPE_PREFIX):]
+            with self.block.alloc_temp() as member:
+              self.writer.write_checked_call2(
+                  member, 'πg.GetAttr(πF, {}, {}, nil)',
+                  mod.expr, self.block.root.intern(name))
+              self.block.bind_var(
+                  self.writer, binding.alias, member.expr)
+      elif node.module == '__future__':
+        # At this stage all future imports are done in an initial pass (see
+        # visit() above), so if they are encountered here after the last valid
+        # __future__ then it's a syntax error.
+        if node.lineno > self.future_features.future_lineno:
+          raise util.ImportError(node, late_future)
+      else:
+        self._import_and_bind(imp)
 
   def visit_Module(self, node):
     self._visit_each(node.body)
@@ -436,15 +426,15 @@ class StatementVisitor(algorithm.Visitor):
       self.writer.write('{} = make([]*πg.Object, {})'.format(
           args.expr, len(node.values)))
       for i, v in enumerate(node.values):
-        with self.expr_visitor.visit(v) as arg:
+        with self.visit_expr(v) as arg:
           self.writer.write('{}[{}] = {}'.format(args.expr, i, arg.expr))
       self.writer.write_checked_call1('πg.Print(πF, {}, {})', args.expr,
                                       'true' if node.nl else 'false')
 
   def visit_Raise(self, node):
-    with self.expr_visitor.visit(node.exc) if node.exc else _nil_expr as t,\
-        self.expr_visitor.visit(node.inst) if node.inst else _nil_expr as inst,\
-        self.expr_visitor.visit(node.tback) if node.tback else _nil_expr as tb:
+    with self.visit_expr(node.exc) if node.exc else _nil_expr as t,\
+        self.visit_expr(node.inst) if node.inst else _nil_expr as inst,\
+        self.visit_expr(node.tback) if node.tback else _nil_expr as tb:
       if node.inst:
         assert node.exc, 'raise had inst but no type'
       if node.tback:
@@ -460,7 +450,7 @@ class StatementVisitor(algorithm.Visitor):
     if self.block.is_generator and node.value:
       raise util.ParseError(node, 'returning a value in a generator function')
     if node.value:
-      with self.expr_visitor.visit(node.value) as value:
+      with self.visit_expr(node.value) as value:
         self.writer.write('return {}, nil'.format(value.expr))
     else:
       self.writer.write('return nil, nil')
@@ -550,7 +540,7 @@ class StatementVisitor(algorithm.Visitor):
     self._write_py_context(node.lineno)
     self.writer.write_label(loop.start_label)
     orelse_label = self.block.genlabel() if node.orelse else loop.end_label
-    with self.expr_visitor.visit(node.test) as cond,\
+    with self.visit_expr(node.test) as cond,\
         self.block.alloc_temp('bool') as is_true:
       self.writer.write_checked_call2(is_true, 'πg.IsTrue(πF, {})', cond.expr)
       self.writer.write_tmpl(textwrap.dedent("""\
@@ -567,25 +557,12 @@ class StatementVisitor(algorithm.Visitor):
     self.writer.write_label(loop.end_label)
     self.block.pop_loop()
 
-  _AUG_ASSIGN_TEMPLATES = {
-      ast.Add: 'πg.IAdd(πF, {lhs}, {rhs})',
-      ast.BitAnd: 'πg.IAnd(πF, {lhs}, {rhs})',
-      ast.Div: 'πg.IDiv(πF, {lhs}, {rhs})',
-      ast.LShift: 'πg.ILShift(πF, {lhs}, {rhs})',
-      ast.Mod: 'πg.IMod(πF, {lhs}, {rhs})',
-      ast.Mult: 'πg.IMul(πF, {lhs}, {rhs})',
-      ast.BitOr: 'πg.IOr(πF, {lhs}, {rhs})',
-      ast.RShift: 'πg.IRShift(πF, {lhs}, {rhs})',
-      ast.Sub: 'πg.ISub(πF, {lhs}, {rhs})',
-      ast.BitXor: 'πg.IXor(πF, {lhs}, {rhs})',
-  }
-
   def visit_With(self, node):
     assert len(node.items) == 1, 'multiple items in a with not yet supported'
     item = node.items[0]
     self._write_py_context(node.loc.line())
     # mgr := EXPR
-    with self.expr_visitor.visit(item.context_expr) as mgr,\
+    with self.visit_expr(item.context_expr) as mgr,\
         self.block.alloc_temp() as exit_func,\
         self.block.alloc_temp() as value:
       # The code here has a subtle twist: It gets the exit function attribute
@@ -598,11 +575,11 @@ class StatementVisitor(algorithm.Visitor):
       # exit := type(mgr).__exit__
       self.writer.write_checked_call2(
           exit_func, 'πg.GetAttr(πF, {}.Type().ToObject(), {}, nil)',
-          mgr.expr, self.block.intern('__exit__'))
+          mgr.expr, self.block.root.intern('__exit__'))
       # value := type(mgr).__enter__(mgr)
       self.writer.write_checked_call2(
           value, 'πg.GetAttr(πF, {}.Type().ToObject(), {}, nil)',
-          mgr.expr, self.block.intern('__enter__'))
+          mgr.expr, self.block.root.intern('__enter__'))
       self.writer.write_checked_call2(
           value, '{}.Call(πF, πg.Args{{{}}}, nil)',
           value.expr, mgr.expr)
@@ -650,17 +627,91 @@ class StatementVisitor(algorithm.Visitor):
             \tcontinue
             }"""), exc=exc.expr, swallow_exc=swallow_exc_bool.expr)
 
+  def visit_function_inline(self, node):
+    """Returns an GeneratedExpr for a function with the given body."""
+    # First pass collects the names of locals used in this function. Do this in
+    # a separate pass so that we know whether to resolve a name as a local or a
+    # global during the second pass.
+    func_visitor = block.FunctionBlockVisitor(node)
+    for child in node.body:
+      func_visitor.visit(child)
+    func_block = block.FunctionBlock(self.block, node.name, func_visitor.vars,
+                                     func_visitor.is_generator)
+    visitor = StatementVisitor(func_block)
+    # Indent so that the function body is aligned with the goto labels.
+    with visitor.writer.indent_block():
+      visitor._visit_each(node.body)  # pylint: disable=protected-access
+
+    result = self.block.alloc_temp()
+    with self.block.alloc_temp('[]πg.Param') as func_args:
+      args = node.args
+      argc = len(args.args)
+      self.writer.write('{} = make([]πg.Param, {})'.format(
+          func_args.expr, argc))
+      # The list of defaults only contains args for which a default value is
+      # specified so pad it with None to make it the same length as args.
+      defaults = [None] * (argc - len(args.defaults)) + args.defaults
+      for i, (a, d) in enumerate(zip(args.args, defaults)):
+        with self.visit_expr(d) if d else expr.nil_expr as default:
+          tmpl = '$args[$i] = πg.Param{Name: $name, Def: $default}'
+          self.writer.write_tmpl(tmpl, args=func_args.expr, i=i,
+                                 name=util.go_str(a.arg), default=default.expr)
+      flags = []
+      if args.vararg:
+        flags.append('πg.CodeFlagVarArg')
+      if args.kwarg:
+        flags.append('πg.CodeFlagKWArg')
+      # The function object gets written to a temporary writer because we need
+      # it as an expression that we subsequently bind to some variable.
+      self.writer.write_tmpl(
+          '$result = πg.NewFunction(πg.NewCode($name, $filename, $args, '
+          '$flags, func(πF *πg.Frame, πArgs []*πg.Object) '
+          '(*πg.Object, *πg.BaseException) {',
+          result=result.name, name=util.go_str(node.name),
+          filename=util.go_str(self.block.root.filename), args=func_args.expr,
+          flags=' | '.join(flags) if flags else 0)
+      with self.writer.indent_block():
+        for var in func_block.vars.values():
+          if var.type != block.Var.TYPE_GLOBAL:
+            fmt = 'var {0} *πg.Object = {1}; _ = {0}'
+            self.writer.write(fmt.format(
+                util.adjust_local_name(var.name), var.init_expr))
+        self.writer.write_temp_decls(func_block)
+        if func_block.is_generator:
+          self.writer.write('return πg.NewGenerator(πF, func(πSent *πg.Object) '
+                            '(*πg.Object, *πg.BaseException) {')
+          with self.writer.indent_block():
+            self.writer.write_block(func_block, visitor.writer.getvalue())
+          self.writer.write('}).ToObject(), nil')
+        else:
+          self.writer.write_block(func_block, visitor.writer.getvalue())
+      self.writer.write('}), πF.Globals()).ToObject()')
+    return result
+
+  _AUG_ASSIGN_TEMPLATES = {
+      ast.Add: 'πg.IAdd(πF, {lhs}, {rhs})',
+      ast.BitAnd: 'πg.IAnd(πF, {lhs}, {rhs})',
+      ast.Div: 'πg.IDiv(πF, {lhs}, {rhs})',
+      ast.LShift: 'πg.ILShift(πF, {lhs}, {rhs})',
+      ast.Mod: 'πg.IMod(πF, {lhs}, {rhs})',
+      ast.Mult: 'πg.IMul(πF, {lhs}, {rhs})',
+      ast.BitOr: 'πg.IOr(πF, {lhs}, {rhs})',
+      ast.RShift: 'πg.IRShift(πF, {lhs}, {rhs})',
+      ast.Sub: 'πg.ISub(πF, {lhs}, {rhs})',
+      ast.BitXor: 'πg.IXor(πF, {lhs}, {rhs})',
+  }
+
   def _assign_target(self, target, value):
     if isinstance(target, ast.Name):
       self.block.bind_var(self.writer, target.id, value)
     elif isinstance(target, ast.Attribute):
-      with self.expr_visitor.visit(target.value) as obj:
+      with self.visit_expr(target.value) as obj:
         self.writer.write_checked_call1(
             'πg.SetAttr(πF, {}, {}, {})', obj.expr,
-            self.block.intern(target.attr), value)
+            self.block.root.intern(target.attr), value)
     elif isinstance(target, ast.Subscript):
-      with self.expr_visitor.visit(target.value) as mapping,\
-          self.expr_visitor.visit(target.slice) as index:
+      with self.visit_expr(target.value) as mapping,\
+          self.visit_expr(target.slice) as index:
         self.writer.write_checked_call1('πg.SetItem(πF, {}, {}, {})',
                                         mapping.expr, index.expr, value)
     else:
@@ -679,49 +730,58 @@ class StatementVisitor(algorithm.Visitor):
     tmpl = 'πg.TieTarget{Target: &$temp}'
     return string.Template(tmpl).substitute(temp=temp.name)
 
-  def _import(self, name, index):
-    """Returns an expression for a Module object returned from ImportModule.
+  def _import_and_bind(self, imp):
+    """Generates code that imports a module and binds it to a variable.
 
     Args:
-      name: The fully qualified Python module name, e.g. foo.bar.
-      index: The element in the list of modules that this expression should
-          select. E.g. for 'foo.bar', 0 corresponds to the package foo and 1
-          corresponds to the module bar.
-    Returns:
-      A Go expression evaluating to an *Object (upcast from a *Module.)
+      imp: Import object representing an import of the form "import x.y.z" or
+          "from x.y import z". Expects only a single binding.
     """
-    parts = name.split('.')
+    # Acquire handles to the Code objects in each Go package and call
+    # ImportModule to initialize all modules.
+    parts = imp.name.split('.')
     code_objs = []
     for i in xrange(len(parts)):
       package_name = '/'.join(parts[:i + 1])
-      if package_name != self.block.full_package_name:
-        package = self.block.add_import(package_name)
+      if package_name != self.block.root.full_package_name:
+        package = self.block.root.add_import(package_name)
         code_objs.append('{}.Code'.format(package.alias))
       else:
         code_objs.append('Code')
-    mod = self.block.alloc_temp()
-    with self.block.alloc_temp('[]*πg.Object') as mod_slice:
+    with self.block.alloc_temp() as mod, \
+        self.block.alloc_temp('[]*πg.Object') as mod_slice:
       handles_expr = '[]*πg.Code{' + ', '.join(code_objs) + '}'
       self.writer.write_checked_call2(
           mod_slice, 'πg.ImportModule(πF, {}, {})',
-          util.go_str(name), handles_expr)
-      self.writer.write('{} = {}[{}]'.format(mod.name, mod_slice.expr, index))
-    return mod
+          util.go_str(imp.name), handles_expr)
+
+      # Bind the imported modules or members to variables in the current scope.
+      for binding in imp.bindings:
+        self.writer.write('{} = {}[{}]'.format(
+            mod.name, mod_slice.expr, imp.name.count('.')))
+        if binding.bind_type == imputil.Import.MODULE:
+          self.block.bind_var(self.writer, binding.alias, mod.expr)
+        else:
+          # Binding a member of the imported module.
+          with self.block.alloc_temp() as member:
+            self.writer.write_checked_call2(
+                member, 'πg.GetAttr(πF, {}, {}, nil)',
+                mod.expr, self.block.root.intern(binding.value))
+            self.block.bind_var(self.writer, binding.alias, member.expr)
 
   def _import_native(self, name, values):
-    reflect_package = self.block.add_native_import('reflect')
-    import_name = name[len(_NATIVE_MODULE_PREFIX):]
+    reflect_package = self.block.root.add_native_import('reflect')
     # Work-around for importing go module from VCS
     # TODO: support bzr|git|hg|svn from any server
     package_name = None
     for x in _KNOWN_VCS:
-      if import_name.startswith(x):
-        package_name = x + import_name[len(x):].replace('.', '/')
+      if name.startswith(x):
+        package_name = x + name[len(x):].replace('.', '/')
         break
     if not package_name:
-      package_name = import_name.replace('.', '/')
+      package_name = name.replace('.', '/')
 
-    package = self.block.add_native_import(package_name)
+    package = self.block.root.add_native_import(package_name)
     mod = self.block.alloc_temp()
     with self.block.alloc_temp('map[string]*πg.Object') as members:
       self.writer.write_tmpl('$members = map[string]*πg.Object{}',
@@ -793,7 +853,7 @@ class StatementVisitor(algorithm.Visitor):
     for i, except_node in enumerate(handlers):
       handler_labels.append(self.block.genlabel())
       if except_node.type:
-        with self.expr_visitor.visit(except_node.type) as type_,\
+        with self.visit_expr(except_node.type) as type_,\
             self.block.alloc_temp('bool') as is_inst:
           self.writer.write_checked_call2(
               is_inst, 'πg.IsInstance(πF, {}.ToObject(), {})', exc, type_.expr)
@@ -816,6 +876,6 @@ class StatementVisitor(algorithm.Visitor):
 
   def _write_py_context(self, lineno):
     if lineno:
-      line = self.block.buffer.source_line(lineno).strip()
+      line = self.block.root.buffer.source_line(lineno).strip()
       self.writer.write('// line {}: {}'.format(lineno, line))
       self.writer.write('πF.SetLineno({})'.format(lineno))

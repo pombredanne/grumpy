@@ -24,6 +24,7 @@ import unittest
 import pythonparser
 
 from grumpy.compiler import block
+from grumpy.compiler import imputil_test
 from grumpy.compiler import stmt
 from grumpy.compiler import util
 
@@ -46,20 +47,20 @@ class BlockTest(unittest.TestCase):
     module_block = _MakeModuleBlock()
     func1_block = block.FunctionBlock(module_block, 'func1', {}, False)
     func2_block = block.FunctionBlock(func1_block, 'func2', {}, False)
-    package = func2_block.add_import('foo/bar')
-    self.assertEqual(package.name, 'grumpy/lib/foo/bar')
-    self.assertEqual(package.alias, 'π_grumpyΓlibΓfooΓbar')
-    self.assertEqual(module_block.imports, {'grumpy/lib/foo/bar': package})
+    package = func2_block.root.add_import('foo/bar')
+    self.assertEqual(package.name, '__python__/foo/bar')
+    self.assertEqual(package.alias, 'π___python__ΓfooΓbar')
+    self.assertEqual(module_block.imports, {'__python__/foo/bar': package})
 
   def testAddImportRepeated(self):
     b = _MakeModuleBlock()
-    package = b.add_import('foo')
-    self.assertEqual(package.name, 'grumpy/lib/foo')
-    self.assertEqual(package.alias, 'π_grumpyΓlibΓfoo')
-    self.assertEqual(b.imports, {'grumpy/lib/foo': package})
-    package2 = b.add_import('foo')
+    package = b.root.add_import('foo')
+    self.assertEqual(package.name, '__python__/foo')
+    self.assertEqual(package.alias, 'π___python__Γfoo')
+    self.assertEqual(b.imports, {'__python__/foo': package})
+    package2 = b.root.add_import('foo')
     self.assertIs(package, package2)
-    self.assertEqual(b.imports, {'grumpy/lib/foo': package})
+    self.assertEqual(b.imports, {'__python__/foo': package})
 
   def testLoop(self):
     b = _MakeModuleBlock()
@@ -246,8 +247,8 @@ class FunctionBlockVisitorTest(unittest.TestCase):
 
 
 def _MakeModuleBlock():
-  return block.ModuleBlock('__main__', 'grumpy', 'grumpy/lib', '<test>', '',
-                           stmt.FutureFeatures())
+  return block.ModuleBlock(imputil_test.MockPath(), '__main__',
+                           '<test>', '', stmt.FutureFeatures())
 
 
 def _ParseStmt(stmt_str):

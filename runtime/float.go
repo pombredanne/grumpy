@@ -71,12 +71,31 @@ func floatDiv(f *Frame, v, w *Object) (*Object, *BaseException) {
 	})
 }
 
+func floatDivMod(f *Frame, v, w *Object) (*Object, *BaseException) {
+	return floatDivAndModOp(f, "__divmod__", v, w, func(v, w float64) (float64, float64, bool) {
+		m, r := floatModFunc(v, w)
+		if !r {
+			return 0, 0, false
+		}
+		return math.Floor(v / w), m, true
+	})
+}
+
 func floatEq(f *Frame, v, w *Object) (*Object, *BaseException) {
 	return floatCompare(toFloatUnsafe(v), w, False, True, False), nil
 }
 
 func floatFloat(f *Frame, o *Object) (*Object, *BaseException) {
 	return o, nil
+}
+
+func floatFloorDiv(f *Frame, v, w *Object) (*Object, *BaseException) {
+	return floatDivModOp(f, "__floordiv__", v, w, func(v, w float64) (float64, bool) {
+		if w == 0.0 {
+			return 0, false
+		}
+		return math.Floor(v / w), true
+	})
 }
 
 func floatGE(f *Frame, v, w *Object) (*Object, *BaseException) {
@@ -234,8 +253,27 @@ func floatRDiv(f *Frame, v, w *Object) (*Object, *BaseException) {
 	})
 }
 
+func floatRDivMod(f *Frame, v, w *Object) (*Object, *BaseException) {
+	return floatDivAndModOp(f, "__rdivmod__", v, w, func(v, w float64) (float64, float64, bool) {
+		m, r := floatModFunc(w, v)
+		if !r {
+			return 0, 0, false
+		}
+		return w / v, m, true
+	})
+}
+
 func floatRepr(f *Frame, o *Object) (*Object, *BaseException) {
 	return NewStr(strconv.FormatFloat(toFloatUnsafe(o).Value(), 'g', -1, 64)).ToObject(), nil
+}
+
+func floatRFloorDiv(f *Frame, v, w *Object) (*Object, *BaseException) {
+	return floatDivModOp(f, "__rfloordiv__", v, w, func(v, w float64) (float64, bool) {
+		if v == 0.0 {
+			return 0, false
+		}
+		return math.Floor(w / v), true
+	})
 }
 
 func floatRMod(f *Frame, v, w *Object) (*Object, *BaseException) {
@@ -265,8 +303,10 @@ func initFloatType(dict map[string]*Object) {
 	FloatType.slots.Abs = &unaryOpSlot{floatAbs}
 	FloatType.slots.Add = &binaryOpSlot{floatAdd}
 	FloatType.slots.Div = &binaryOpSlot{floatDiv}
+	FloatType.slots.DivMod = &binaryOpSlot{floatDivMod}
 	FloatType.slots.Eq = &binaryOpSlot{floatEq}
 	FloatType.slots.Float = &unaryOpSlot{floatFloat}
+	FloatType.slots.FloorDiv = &binaryOpSlot{floatFloorDiv}
 	FloatType.slots.GE = &binaryOpSlot{floatGE}
 	FloatType.slots.GT = &binaryOpSlot{floatGT}
 	FloatType.slots.Hash = &unaryOpSlot{floatHash}
@@ -285,7 +325,9 @@ func initFloatType(dict map[string]*Object) {
 	FloatType.slots.Pow = &binaryOpSlot{floatPow}
 	FloatType.slots.RAdd = &binaryOpSlot{floatRAdd}
 	FloatType.slots.RDiv = &binaryOpSlot{floatRDiv}
+	FloatType.slots.RDivMod = &binaryOpSlot{floatRDivMod}
 	FloatType.slots.Repr = &unaryOpSlot{floatRepr}
+	FloatType.slots.RFloorDiv = &binaryOpSlot{floatRFloorDiv}
 	FloatType.slots.RMod = &binaryOpSlot{floatRMod}
 	FloatType.slots.RMul = &binaryOpSlot{floatRMul}
 	FloatType.slots.RPow = &binaryOpSlot{floatRPow}
@@ -373,6 +415,21 @@ func floatDivModOp(f *Frame, method string, v, w *Object, fun func(v, w float64)
 		return nil, f.RaiseType(ZeroDivisionErrorType, "float division or modulo by zero")
 	}
 	return NewFloat(x).ToObject(), nil
+}
+
+func floatDivAndModOp(f *Frame, method string, v, w *Object, fun func(v, w float64) (float64, float64, bool)) (*Object, *BaseException) {
+	floatW, ok := floatCoerce(w)
+	if !ok {
+		if math.IsInf(floatW, 0) {
+			return nil, f.RaiseType(OverflowErrorType, "long int too large to convert to float")
+		}
+		return NotImplemented, nil
+	}
+	q, m, ok := fun(toFloatUnsafe(v).Value(), floatW)
+	if !ok {
+		return nil, f.RaiseType(ZeroDivisionErrorType, "float division or modulo by zero")
+	}
+	return NewTuple2(NewFloat(q).ToObject(), NewFloat(m).ToObject()).ToObject(), nil
 }
 
 func hashFloat(v float64) int {

@@ -27,6 +27,7 @@ import pythonparser
 from pythonparser import ast
 
 from grumpy.compiler import block
+from grumpy.compiler import imputil_test
 from grumpy.compiler import shard_test
 from grumpy.compiler import stmt
 from grumpy.compiler import util
@@ -296,6 +297,11 @@ class StatementVisitorTest(unittest.TestCase):
         import sys
         print type(sys.modules)""")))
 
+  def testImportMember(self):
+    self.assertEqual((0, "<type 'dict'>\n"), _GrumpRun(textwrap.dedent("""\
+        from sys import modules
+        print type(modules)""")))
+
   def testImportConflictingPackage(self):
     self.assertEqual((0, ''), _GrumpRun(textwrap.dedent("""\
         import time
@@ -306,14 +312,14 @@ class StatementVisitorTest(unittest.TestCase):
         from __go__.time import Nanosecond, Second
         print Nanosecond, Second""")))
 
-  def testImportGrump(self):
+  def testImportGrumpy(self):
     self.assertEqual((0, ''), _GrumpRun(textwrap.dedent("""\
         from __go__.grumpy import Assert
         Assert(__frame__(), True, 'bad')""")))
 
   def testImportNativeModuleRaises(self):
     regexp = r'for native imports use "from __go__\.xyz import \.\.\." syntax'
-    self.assertRaisesRegexp(util.ParseError, regexp, _ParseAndVisit,
+    self.assertRaisesRegexp(util.ImportError, regexp, _ParseAndVisit,
                             'import __go__.foo')
 
   def testImportNativeType(self):
@@ -368,11 +374,11 @@ class StatementVisitorTest(unittest.TestCase):
 
   def testImportWildcardMemberRaises(self):
     regexp = r'wildcard member import is not implemented: from foo import *'
-    self.assertRaisesRegexp(util.ParseError, regexp, _ParseAndVisit,
+    self.assertRaisesRegexp(util.ImportError, regexp, _ParseAndVisit,
                             'from foo import *')
     regexp = (r'wildcard member import is not '
               r'implemented: from __go__.foo import *')
-    self.assertRaisesRegexp(util.ParseError, regexp, _ParseAndVisit,
+    self.assertRaisesRegexp(util.ImportError, regexp, _ParseAndVisit,
                             'from __go__.foo import *')
 
   def testVisitFuture(self):
@@ -601,15 +607,15 @@ class StatementVisitorTest(unittest.TestCase):
 
 
 def _MakeModuleBlock():
-  return block.ModuleBlock('__main__', 'grumpy', 'grumpy/lib', '<test>', '',
-                           stmt.FutureFeatures())
+  return block.ModuleBlock(imputil_test.MockPath(), '__main__',
+                           '<test>', '', stmt.FutureFeatures())
 
 
 def _ParseAndVisit(source):
   mod = pythonparser.parse(source)
   future_features = stmt.visit_future(mod)
-  b = block.ModuleBlock('__main__', 'grumpy', 'grumpy/lib', '<test>',
-                        source, future_features)
+  b = block.ModuleBlock(imputil_test.MockPath(), '__main__',
+                        '<test>', source, future_features)
   visitor = stmt.StatementVisitor(b)
   visitor.visit(mod)
   return visitor

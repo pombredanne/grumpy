@@ -380,8 +380,10 @@ type typeSlots struct {
 	Delete       *deleteSlot
 	DelItem      *delItemSlot
 	Div          *binaryOpSlot
+	DivMod       *binaryOpSlot
 	Eq           *binaryOpSlot
 	Float        *unaryOpSlot
+	FloorDiv     *binaryOpSlot
 	GE           *binaryOpSlot
 	Get          *getSlot
 	GetAttribute *getAttributeSlot
@@ -392,6 +394,8 @@ type typeSlots struct {
 	IAdd         *binaryOpSlot
 	IAnd         *binaryOpSlot
 	IDiv         *binaryOpSlot
+	IDivMod      *binaryOpSlot
+	IFloorDiv    *binaryOpSlot
 	ILShift      *binaryOpSlot
 	IMod         *binaryOpSlot
 	IMul         *binaryOpSlot
@@ -425,7 +429,9 @@ type typeSlots struct {
 	RAdd         *binaryOpSlot
 	RAnd         *binaryOpSlot
 	RDiv         *binaryOpSlot
+	RDivMod      *binaryOpSlot
 	Repr         *unaryOpSlot
+	RFloorDiv    *binaryOpSlot
 	RLShift      *binaryOpSlot
 	RMod         *binaryOpSlot
 	RMul         *binaryOpSlot
