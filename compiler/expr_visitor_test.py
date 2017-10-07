@@ -22,12 +22,11 @@ import subprocess
 import textwrap
 import unittest
 
-import pythonparser
-
 from grumpy.compiler import block
-from grumpy.compiler import imputil_test
+from grumpy.compiler import imputil
 from grumpy.compiler import shard_test
 from grumpy.compiler import stmt
+from grumpy import pythonparser
 
 
 def _MakeExprTest(expr):
@@ -189,10 +188,10 @@ class ExprVisitorTest(unittest.TestCase):
                                      '12345678901234567890L')
   testNumFloat = _MakeLiteralTest('102.1')
   testNumFloatOnlyDecimal = _MakeLiteralTest('.5', '0.5')
-  testNumFloatNoDecimal = _MakeLiteralTest('5.', '5')
-  testNumFloatSci = _MakeLiteralTest('1e6', '1e+06')
-  testNumFloatSciCap = _MakeLiteralTest('1E6', '1e+06')
-  testNumFloatSciCapPlus = _MakeLiteralTest('1E+6', '1e+06')
+  testNumFloatNoDecimal = _MakeLiteralTest('5.', '5.0')
+  testNumFloatSci = _MakeLiteralTest('1e6', '1000000.0')
+  testNumFloatSciCap = _MakeLiteralTest('1E6', '1000000.0')
+  testNumFloatSciCapPlus = _MakeLiteralTest('1E+6', '1000000.0')
   testNumFloatSciMinus = _MakeLiteralTest('1e-06')
   testNumComplex = _MakeLiteralTest('3j')
 
@@ -221,9 +220,10 @@ class ExprVisitorTest(unittest.TestCase):
   testUnaryOpInvert = _MakeExprTest('~4')
   testUnaryOpPos = _MakeExprTest('+4')
 
+
 def _MakeModuleBlock():
-  return block.ModuleBlock(imputil_test.MockPath(), '__main__',
-                           '<test>', '', stmt.FutureFeatures())
+  return block.ModuleBlock(None, '__main__', '<test>', '',
+                           imputil.FutureFeatures())
 
 
 def _ParseExpr(expr):

@@ -585,6 +585,37 @@ func TestDictPop(t *testing.T) {
 	}
 }
 
+func TestDictPopItem(t *testing.T) {
+	popItem := mustNotRaise(GetAttr(NewRootFrame(), DictType.ToObject(), NewStr("popitem"), nil))
+	fun := wrapFuncForTest(func(f *Frame, d *Dict) (*Object, *BaseException) {
+		result := NewDict()
+		item, raised := popItem.Call(f, wrapArgs(d), nil)
+		for ; raised == nil; item, raised = popItem.Call(f, wrapArgs(d), nil) {
+			t := toTupleUnsafe(item)
+			result.SetItem(f, t.GetItem(0), t.GetItem(1))
+		}
+		if raised != nil {
+			if !raised.isInstance(KeyErrorType) {
+				return nil, raised
+			}
+			f.RestoreExc(nil, nil)
+		}
+		if raised = Assert(f, GetBool(d.Len() == 0).ToObject(), nil); raised != nil {
+			return nil, raised
+		}
+		return result.ToObject(), nil
+	})
+	cases := []invokeTestCase{
+		{args: wrapArgs(newTestDict("foo", 42)), want: newTestDict("foo", 42).ToObject()},
+		{args: wrapArgs(newTestDict("foo", 42, 123, "bar")), want: newTestDict("foo", 42, 123, "bar").ToObject()},
+	}
+	for _, cas := range cases {
+		if err := runInvokeTestCase(fun, &cas); err != "" {
+			t.Error(err)
+		}
+	}
+}
+
 func TestDictNewInit(t *testing.T) {
 	cases := []invokeTestCase{
 		{args: wrapArgs(), want: NewDict().ToObject()},
@@ -610,6 +641,30 @@ func TestDictNewRaises(t *testing.T) {
 	}
 	for _, cas := range cases {
 		if err := runInvokeMethodTestCase(DictType, "__new__", &cas); err != "" {
+			t.Error(err)
+		}
+	}
+}
+
+func TestDictSetDefault(t *testing.T) {
+	setDefaultMethod := mustNotRaise(GetAttr(NewRootFrame(), DictType.ToObject(), NewStr("setdefault"), nil))
+	setDefault := newBuiltinFunction("TestDictSetDefault", func(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
+		i, raised := setDefaultMethod.Call(f, args, kwargs)
+		if raised != nil {
+			return nil, raised
+		}
+		return NewTuple(i, args[0]).ToObject(), nil
+	}).ToObject()
+	cases := []invokeTestCase{
+		{args: wrapArgs(NewDict(), "foo"), want: newTestTuple(None, newTestDict("foo", None)).ToObject()},
+		{args: wrapArgs(NewDict(), "foo", 42), want: newTestTuple(42, newTestDict("foo", 42)).ToObject()},
+		{args: wrapArgs(newTestDict("foo", 42), "foo"), want: newTestTuple(42, newTestDict("foo", 42)).ToObject()},
+		{args: wrapArgs(newTestDict("foo", 42), "foo", 43), want: newTestTuple(42, newTestDict("foo", 42)).ToObject()},
+		{args: wrapArgs(NewDict()), wantExc: mustCreateException(TypeErrorType, "setdefault expected at least 1 arguments, got 0")},
+		{args: wrapArgs(NewDict(), "foo", "bar", "baz"), wantExc: mustCreateException(TypeErrorType, "setdefault expected at most 2 arguments, got 3")},
+	}
+	for _, cas := range cases {
+		if err := runInvokeTestCase(setDefault, &cas); err != "" {
 			t.Error(err)
 		}
 	}

@@ -204,7 +204,7 @@ func nativeFuncGetName(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) 
 }
 
 func nativeFuncRepr(f *Frame, o *Object) (*Object, *BaseException) {
-	name, raised := GetAttr(f, o, NewStr("__name__"), NewStr("<unknown>").ToObject())
+	name, raised := GetAttr(f, o, internedName, NewStr("<unknown>").ToObject())
 	if raised != nil {
 		return nil, raised
 	}
@@ -222,12 +222,133 @@ func initNativeFuncType(dict map[string]*Object) {
 	nativeFuncType.slots.Repr = &unaryOpSlot{nativeFuncRepr}
 }
 
+func nativeSliceGetItem(f *Frame, o, key *Object) (*Object, *BaseException) {
+	v := toNativeUnsafe(o).value
+	if key.typ.slots.Index != nil {
+		elem, raised := nativeSliceGetIndex(f, v, key)
+		if raised != nil {
+			return nil, raised
+		}
+		return WrapNative(f, elem)
+	}
+	if !key.isInstance(SliceType) {
+		return nil, f.RaiseType(TypeErrorType, fmt.Sprintf("native slice indices must be integers, not %s", key.typ.Name()))
+	}
+	s := toSliceUnsafe(key)
+	start, stop, step, sliceLen, raised := s.calcSlice(f, v.Len())
+	if raised != nil {
+		return nil, raised
+	}
+	if step == 1 {
+		return WrapNative(f, v.Slice(start, stop))
+	}
+	result := reflect.MakeSlice(v.Type(), sliceLen, sliceLen)
+	i := 0
+	for j := start; j != stop; j += step {
+		resultElem := result.Index(i)
+		resultElem.Set(v.Index(j))
+		i++
+	}
+	return WrapNative(f, result)
+}
+
 func nativeSliceIter(f *Frame, o *Object) (*Object, *BaseException) {
 	return newSliceIterator(toNativeUnsafe(o).value), nil
 }
 
+func nativeSliceLen(f *Frame, o *Object) (*Object, *BaseException) {
+	return NewInt(toNativeUnsafe(o).value.Len()).ToObject(), nil
+}
+
+func nativeSliceRepr(f *Frame, o *Object) (*Object, *BaseException) {
+	v := toNativeUnsafe(o).value
+	typeName := nativeTypeName(v.Type())
+	if f.reprEnter(o) {
+		return NewStr(fmt.Sprintf("%s{...}", typeName)).ToObject(), nil
+	}
+	defer f.reprLeave(o)
+	numElems := v.Len()
+	elems := make([]*Object, numElems)
+	for i := 0; i < numElems; i++ {
+		elem, raised := WrapNative(f, v.Index(i))
+		if raised != nil {
+			return nil, raised
+		}
+		elems[i] = elem
+	}
+	repr, raised := seqRepr(f, elems)
+	if raised != nil {
+		return nil, raised
+	}
+	return NewStr(fmt.Sprintf("%s{%s}", typeName, repr)).ToObject(), nil
+}
+
+func nativeSliceSetItem(f *Frame, o, key, value *Object) *BaseException {
+	v := toNativeUnsafe(o).value
+	elemType := v.Type().Elem()
+	if key.typ.slots.Int != nil {
+		elem, raised := nativeSliceGetIndex(f, v, key)
+		if raised != nil {
+			return raised
+		}
+		if !elem.CanSet() {
+			return f.RaiseType(TypeErrorType, "cannot set slice element")
+		}
+		elemVal, raised := maybeConvertValue(f, value, elemType)
+		if raised != nil {
+			return raised
+		}
+		elem.Set(elemVal)
+		return nil
+	}
+	if key.isInstance(SliceType) {
+		s := toSliceUnsafe(key)
+		start, stop, step, sliceLen, raised := s.calcSlice(f, v.Len())
+		if raised != nil {
+			return raised
+		}
+		if !v.Index(start).CanSet() {
+			return f.RaiseType(TypeErrorType, "cannot set slice element")
+		}
+		return seqApply(f, value, func(elems []*Object, _ bool) *BaseException {
+			numElems := len(elems)
+			if sliceLen != numElems {
+				format := "attempt to assign sequence of size %d to slice of size %d"
+				return f.RaiseType(ValueErrorType, fmt.Sprintf(format, numElems, sliceLen))
+			}
+			i := 0
+			for j := start; j != stop; j += step {
+				elemVal, raised := maybeConvertValue(f, elems[i], elemType)
+				if raised != nil {
+					return raised
+				}
+				v.Index(j).Set(elemVal)
+				i++
+			}
+			return nil
+		})
+	}
+	return f.RaiseType(TypeErrorType, fmt.Sprintf("native slice indices must be integers, not %s", key.Type().Name()))
+}
+
 func initNativeSliceType(map[string]*Object) {
+	nativeSliceType.slots.GetItem = &binaryOpSlot{nativeSliceGetItem}
 	nativeSliceType.slots.Iter = &unaryOpSlot{nativeSliceIter}
+	nativeSliceType.slots.Len = &unaryOpSlot{nativeSliceLen}
+	nativeSliceType.slots.Repr = &unaryOpSlot{nativeSliceRepr}
+	nativeSliceType.slots.SetItem = &setItemSlot{nativeSliceSetItem}
+}
+
+func nativeSliceGetIndex(f *Frame, slice reflect.Value, key *Object) (reflect.Value, *BaseException) {
+	i, raised := IndexInt(f, key)
+	if raised != nil {
+		return reflect.Value{}, raised
+	}
+	i, raised = seqCheckedIndex(f, slice.Len(), i)
+	if raised != nil {
+		return reflect.Value{}, raised
+	}
+	return slice.Index(i), nil
 }
 
 type sliceIterator struct {
@@ -316,11 +437,8 @@ func WrapNative(f *Frame, v reflect.Value) (*Object, *BaseException) {
 		return (&Int{Object{typ: t}, i}).ToObject(), nil
 	case reflect.Complex64:
 	case reflect.Complex128:
-		c := v.Complex()
-		// TODO: Switch this over to calling the type when `complex.__new__`
-		// gets implemented.
-		return NewComplex(c).ToObject(), nil
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Uint8, reflect.Uint16:
+		return t.Call(f, Args{NewComplex(v.Complex()).ToObject()}, nil)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32:
 		return t.Call(f, Args{NewInt(int(v.Int())).ToObject()}, nil)
 	// Handle potentially large ints separately in case of overflow.
 	case reflect.Int64:
@@ -329,7 +447,7 @@ func WrapNative(f *Frame, v reflect.Value) (*Object, *BaseException) {
 			return NewLong(big.NewInt(i)).ToObject(), nil
 		}
 		return t.Call(f, Args{NewInt(int(i)).ToObject()}, nil)
-	case reflect.Uint, reflect.Uint32, reflect.Uint64:
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		i := v.Uint()
 		if i > uint64(MaxInt) {
 			return t.Call(f, Args{NewLong((new(big.Int).SetUint64(i))).ToObject()}, nil)
@@ -407,7 +525,7 @@ func getNativeType(rtype reflect.Type) *Type {
 			base = nativeFuncType
 		case reflect.Int16, reflect.Int32, reflect.Int64, reflect.Int8, reflect.Int, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uint8, reflect.Uint, reflect.Uintptr:
 			base = IntType
-		case reflect.Slice:
+		case reflect.Array, reflect.Slice:
 			base = nativeSliceType
 		case reflect.String:
 			base = StrType
@@ -437,7 +555,7 @@ func getNativeType(rtype reflect.Type) *Type {
 				d[name] = newNativeField(name, i, t)
 			}
 		}
-		t.dict = newStringDict(d)
+		t.setDict(newStringDict(d))
 		// This cannot fail since we're defining simple classes.
 		if err := prepareType(t); err != "" {
 			logFatal(err)
@@ -449,7 +567,7 @@ func getNativeType(rtype reflect.Type) *Type {
 }
 
 func newNativeField(name string, i int, t *Type) *Object {
-	nativeFieldGet := func(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+	get := newBuiltinFunction(name, func(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
 		if raised := checkFunctionArgs(f, name, args, t); raised != nil {
 			return nil, raised
 		}
@@ -458,9 +576,28 @@ func newNativeField(name string, i int, t *Type) *Object {
 			v = v.Elem()
 		}
 		return WrapNative(f, v.Field(i))
-	}
-	get := newBuiltinFunction(name, nativeFieldGet).ToObject()
-	return newProperty(get, nil, nil).ToObject()
+	}).ToObject()
+	set := newBuiltinFunction(name, func(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+		if raised := checkFunctionArgs(f, name, args, t, ObjectType); raised != nil {
+			return nil, raised
+		}
+		v := toNativeUnsafe(args[0]).value
+		for v.Type().Kind() == reflect.Ptr {
+			v = v.Elem()
+		}
+		field := v.Field(i)
+		if !field.CanSet() {
+			msg := fmt.Sprintf("cannot set field '%s' of type '%s'", name, t.Name())
+			return nil, f.RaiseType(TypeErrorType, msg)
+		}
+		v, raised := maybeConvertValue(f, args[1], field.Type())
+		if raised != nil {
+			return nil, raised
+		}
+		field.Set(v)
+		return None, nil
+	}).ToObject()
+	return newProperty(get, set, nil).ToObject()
 }
 
 func newNativeMethod(name string, fun reflect.Value) *Object {
@@ -482,7 +619,7 @@ func maybeConvertValue(f *Frame, o *Object, expectedRType reflect.Type) (reflect
 		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice, reflect.UnsafePointer:
 			return reflect.Zero(expectedRType), nil
 		default:
-			return reflect.Value{}, f.RaiseType(TypeErrorType, fmt.Sprintf("cannot convert None to %s", expectedRType))
+			return reflect.Value{}, f.RaiseType(TypeErrorType, fmt.Sprintf("an %s is required", expectedRType))
 		}
 	}
 	val, raised := ToNative(f, o)
@@ -504,7 +641,7 @@ func maybeConvertValue(f *Frame, o *Object, expectedRType reflect.Type) (reflect
 		}
 		break
 	}
-	return reflect.Value{}, f.RaiseType(TypeErrorType, fmt.Sprintf("cannot convert %s to %s", rtype, expectedRType))
+	return reflect.Value{}, f.RaiseType(TypeErrorType, fmt.Sprintf("an %s is required", expectedRType))
 }
 
 func nativeFuncTypeName(rtype reflect.Type) string {
@@ -568,10 +705,12 @@ func nativeInvoke(f *Frame, fun reflect.Value, args Args) (ret *Object, raised *
 			}
 		}
 	}
+	origExc, origTb := f.RestoreExc(nil, nil)
 	result := fun.Call(nativeArgs)
 	if e, _ := f.ExcInfo(); e != nil {
 		return nil, e
 	}
+	f.RestoreExc(origExc, origTb)
 	numResults := len(result)
 	if numResults > 0 && result[numResults-1].Type() == reflect.TypeOf((*BaseException)(nil)) {
 		numResults--

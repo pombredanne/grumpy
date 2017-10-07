@@ -327,23 +327,25 @@ func TestDelItem(t *testing.T) {
 }
 
 func TestFormatException(t *testing.T) {
-	f := NewRootFrame()
-	cases := []struct {
-		o    *Object
-		want string
-	}{
-		{mustNotRaise(ExceptionType.Call(f, nil, nil)), "Exception\n"},
-		{mustNotRaise(AttributeErrorType.Call(f, wrapArgs(""), nil)), "AttributeError\n"},
-		{mustNotRaise(TypeErrorType.Call(f, wrapArgs(123), nil)), "TypeError: 123\n"},
-		{mustNotRaise(AttributeErrorType.Call(f, wrapArgs("hello", "there"), nil)), "AttributeError: ('hello', 'there')\n"},
+	fun := wrapFuncForTest(func(f *Frame, t *Type, args ...*Object) (string, *BaseException) {
+		e, raised := t.Call(f, args, nil)
+		if raised != nil {
+			return "", raised
+		}
+		f.Raise(e, nil, nil)
+		s := FormatExc(f)
+		f.RestoreExc(nil, nil)
+		return s, nil
+	})
+	cases := []invokeTestCase{
+		{args: wrapArgs(ExceptionType), want: NewStr("Exception\n").ToObject()},
+		{args: wrapArgs(AttributeErrorType, ""), want: NewStr("AttributeError\n").ToObject()},
+		{args: wrapArgs(TypeErrorType, 123), want: NewStr("TypeError: 123\n").ToObject()},
+		{args: wrapArgs(AttributeErrorType, "hello", "there"), want: NewStr("AttributeError: ('hello', 'there')\n").ToObject()},
 	}
 	for _, cas := range cases {
-		if !cas.o.isInstance(BaseExceptionType) {
-			t.Errorf("expected FormatException() input to be BaseException, got %s", cas.o.typ.Name())
-		} else if got, raised := FormatException(f, toBaseExceptionUnsafe(cas.o)); raised != nil {
-			t.Errorf("FormatException(%v) raised %v, want nil", cas.o, raised)
-		} else if got != cas.want {
-			t.Errorf("FormatException(%v) = %q, want %q", cas.o, got, cas.want)
+		if err := runInvokeTestCase(fun, &cas); err != "" {
+			t.Error(err)
 		}
 	}
 }
@@ -834,7 +836,8 @@ func TestPyPrint(t *testing.T) {
 	}
 }
 
-func TestPrint(t *testing.T) {
+// TODO(corona10): Re-enable once #282 is addressed.
+/*func TestPrint(t *testing.T) {
 	fun := wrapFuncForTest(func(f *Frame, args *Tuple, nl bool) (string, *BaseException) {
 		return captureStdout(f, func() *BaseException {
 			return Print(NewRootFrame(), args.elems, nl)
@@ -851,7 +854,7 @@ func TestPrint(t *testing.T) {
 			t.Error(err)
 		}
 	}
-}
+}*/
 
 func TestReprRaise(t *testing.T) {
 	testTypes := []*Type{
@@ -1160,6 +1163,20 @@ func TestToNative(t *testing.T) {
 		} else if raised == nil && (!got.IsValid() || !reflect.DeepEqual(got.Interface(), cas.want)) {
 			t.Errorf("ToNative(%v) = %v, want %v", cas.o, got, cas.want)
 		}
+	}
+}
+
+func BenchmarkGetAttr(b *testing.B) {
+	f := NewRootFrame()
+	attr := NewStr("bar")
+	fooType := newTestClass("Foo", []*Type{ObjectType}, NewDict())
+	foo := newObject(fooType)
+	if raised := SetAttr(f, foo, attr, NewInt(123).ToObject()); raised != nil {
+		panic(raised)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		mustNotRaise(GetAttr(f, foo, attr, nil))
 	}
 }
 

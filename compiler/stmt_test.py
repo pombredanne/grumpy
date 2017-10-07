@@ -23,14 +23,13 @@ import subprocess
 import textwrap
 import unittest
 
-import pythonparser
-from pythonparser import ast
-
 from grumpy.compiler import block
-from grumpy.compiler import imputil_test
+from grumpy.compiler import imputil
 from grumpy.compiler import shard_test
 from grumpy.compiler import stmt
 from grumpy.compiler import util
+from grumpy import pythonparser
+from grumpy.pythonparser import ast
 
 
 class StatementVisitorTest(unittest.TestCase):
@@ -104,10 +103,11 @@ class StatementVisitorTest(unittest.TestCase):
         foo &= 3
         print foo""")))
 
-  def testAugAssignUnsupportedOp(self):
-    expected = 'augmented assignment op not implemented'
-    self.assertRaisesRegexp(util.ParseError, expected,
-                            _ParseAndVisit, 'foo **= bar')
+  def testAugAssignPow(self):
+    self.assertEqual((0, '64\n'), _GrumpRun(textwrap.dedent("""\
+        foo = 8
+        foo **= 2
+        print foo""")))
 
   def testClassDef(self):
     self.assertEqual((0, "<type 'type'>\n"), _GrumpRun(textwrap.dedent("""\
@@ -297,6 +297,17 @@ class StatementVisitorTest(unittest.TestCase):
         import sys
         print type(sys.modules)""")))
 
+  def testImportFutureLateRaises(self):
+    regexp = 'from __future__ imports must occur at the beginning of the file'
+    self.assertRaisesRegexp(util.ImportError, regexp, _ParseAndVisit,
+                            'foo = bar\nfrom __future__ import print_function')
+
+  def testFutureUnicodeLiterals(self):
+    want = "u'foo'\n"
+    self.assertEqual((0, want), _GrumpRun(textwrap.dedent("""\
+        from __future__ import unicode_literals
+        print repr('foo')""")))
+
   def testImportMember(self):
     self.assertEqual((0, "<type 'dict'>\n"), _GrumpRun(textwrap.dedent("""\
         from sys import modules
@@ -305,27 +316,29 @@ class StatementVisitorTest(unittest.TestCase):
   def testImportConflictingPackage(self):
     self.assertEqual((0, ''), _GrumpRun(textwrap.dedent("""\
         import time
-        from __go__.time import Now""")))
+        from "__go__/time" import Now""")))
 
   def testImportNative(self):
     self.assertEqual((0, '1 1000000000\n'), _GrumpRun(textwrap.dedent("""\
-        from __go__.time import Nanosecond, Second
+        from "__go__/time" import Nanosecond, Second
         print Nanosecond, Second""")))
 
   def testImportGrumpy(self):
     self.assertEqual((0, ''), _GrumpRun(textwrap.dedent("""\
-        from __go__.grumpy import Assert
+        from "__go__/grumpy" import Assert
         Assert(__frame__(), True, 'bad')""")))
-
-  def testImportNativeModuleRaises(self):
-    regexp = r'for native imports use "from __go__\.xyz import \.\.\." syntax'
-    self.assertRaisesRegexp(util.ImportError, regexp, _ParseAndVisit,
-                            'import __go__.foo')
 
   def testImportNativeType(self):
     self.assertEqual((0, "<type 'Duration'>\n"), _GrumpRun(textwrap.dedent("""\
-        from __go__.time import type_Duration as Duration
+        from "__go__/time" import Duration
         print Duration""")))
+
+  def testImportWildcardMemberRaises(self):
+    regexp = 'wildcard member import is not implemented'
+    self.assertRaisesRegexp(util.ImportError, regexp, _ParseAndVisit,
+                            'from foo import *')
+    self.assertRaisesRegexp(util.ImportError, regexp, _ParseAndVisit,
+                            'from "__go__/foo" import *')
 
   def testPrintStatement(self):
     self.assertEqual((0, 'abc 123\nfoo bar\n'), _GrumpRun(textwrap.dedent("""\
@@ -333,98 +346,7 @@ class StatementVisitorTest(unittest.TestCase):
         print '123'
         print 'foo', 'bar'""")))
 
-  def testImportFromFuture(self):
-    testcases = [
-        ('from __future__ import print_function', stmt.FUTURE_PRINT_FUNCTION),
-        ('from __future__ import generators', 0),
-        ('from __future__ import generators, print_function',
-         stmt.FUTURE_PRINT_FUNCTION),
-    ]
-
-    for i, tc in enumerate(testcases):
-      source, want_flags = tc
-      mod = pythonparser.parse(textwrap.dedent(source))
-      node = mod.body[0]
-      got = stmt.import_from_future(node)
-      msg = '#{}: want {}, got {}'.format(i, want_flags, got)
-      self.assertEqual(want_flags, got, msg=msg)
-
-  def testImportFromFutureParseError(self):
-    testcases = [
-        # NOTE: move this group to testImportFromFuture as they are implemented
-        # by grumpy
-        ('from __future__ import absolute_import',
-         r'future feature \w+ not yet implemented'),
-        ('from __future__ import division',
-         r'future feature \w+ not yet implemented'),
-        ('from __future__ import unicode_literals',
-         r'future feature \w+ not yet implemented'),
-
-        ('from __future__ import braces', 'not a chance'),
-        ('from __future__ import nonexistant_feature',
-         r'future feature \w+ is not defined'),
-    ]
-
-    for tc in testcases:
-      source, want_regexp = tc
-      mod = pythonparser.parse(source)
-      node = mod.body[0]
-      self.assertRaisesRegexp(util.ParseError, want_regexp,
-                              stmt.import_from_future, node)
-
-  def testImportWildcardMemberRaises(self):
-    regexp = r'wildcard member import is not implemented: from foo import *'
-    self.assertRaisesRegexp(util.ImportError, regexp, _ParseAndVisit,
-                            'from foo import *')
-    regexp = (r'wildcard member import is not '
-              r'implemented: from __go__.foo import *')
-    self.assertRaisesRegexp(util.ImportError, regexp, _ParseAndVisit,
-                            'from __go__.foo import *')
-
-  def testVisitFuture(self):
-    testcases = [
-        ('from __future__ import print_function',
-         stmt.FUTURE_PRINT_FUNCTION, 1),
-        ("""\
-        "module docstring"
-
-        from __future__ import print_function
-        """, stmt.FUTURE_PRINT_FUNCTION, 3),
-        ("""\
-        "module docstring"
-
-        from __future__ import print_function, with_statement
-        from __future__ import nested_scopes
-        """, stmt.FUTURE_PRINT_FUNCTION, 4),
-    ]
-
-    for tc in testcases:
-      source, flags, lineno = tc
-      mod = pythonparser.parse(textwrap.dedent(source))
-      future_features = stmt.visit_future(mod)
-      self.assertEqual(future_features.parser_flags, flags)
-      self.assertEqual(future_features.future_lineno, lineno)
-
-  def testVisitFutureParseError(self):
-    testcases = [
-        # future after normal imports
-        """\
-        import os
-        from __future__ import print_function
-        """,
-        # future after non-docstring expression
-        """
-        asd = 123
-        from __future__ import print_function
-        """
-    ]
-
-    for source in testcases:
-      mod = pythonparser.parse(textwrap.dedent(source))
-      self.assertRaisesRegexp(util.ParseError, stmt.late_future,
-                              stmt.visit_future, mod)
-
-  def testFutureFeaturePrintFunction(self):
+  def testPrintFunction(self):
     want = "abc\n123\nabc 123\nabcx123\nabc 123 "
     self.assertEqual((0, want), _GrumpRun(textwrap.dedent("""\
         "module docstring is ok to proceed __future__"
@@ -523,8 +445,8 @@ class StatementVisitorTest(unittest.TestCase):
         finally:
           print 'bar'"""))
     self.assertEqual(1, result[0])
-    # Some platforms show "exit status 1" message so don't test strict equality.
-    self.assertIn('foo bar\nfoo bar\nException\n', result[1])
+    self.assertIn('foo bar\nfoo bar\n', result[1])
+    self.assertIn('Exception\n', result[1])
 
   def testWhile(self):
     self.assertEqual((0, '2\n1\n'), _GrumpRun(textwrap.dedent("""\
@@ -607,15 +529,16 @@ class StatementVisitorTest(unittest.TestCase):
 
 
 def _MakeModuleBlock():
-  return block.ModuleBlock(imputil_test.MockPath(), '__main__',
-                           '<test>', '', stmt.FutureFeatures())
+  return block.ModuleBlock(None, '__main__', '<test>', '',
+                           imputil.FutureFeatures())
 
 
 def _ParseAndVisit(source):
   mod = pythonparser.parse(source)
-  future_features = stmt.visit_future(mod)
-  b = block.ModuleBlock(imputil_test.MockPath(), '__main__',
-                        '<test>', source, future_features)
+  _, future_features = imputil.parse_future_features(mod)
+  importer = imputil.Importer(None, 'foo', 'foo.py', False)
+  b = block.ModuleBlock(importer, '__main__', '<test>',
+                        source, future_features)
   visitor = stmt.StatementVisitor(b)
   visitor.visit(mod)
   return visitor

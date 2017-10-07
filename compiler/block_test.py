@@ -21,12 +21,10 @@ from __future__ import unicode_literals
 import textwrap
 import unittest
 
-import pythonparser
-
 from grumpy.compiler import block
-from grumpy.compiler import imputil_test
-from grumpy.compiler import stmt
+from grumpy.compiler import imputil
 from grumpy.compiler import util
+from grumpy import pythonparser
 
 class PackageTest(unittest.TestCase):
 
@@ -43,30 +41,11 @@ class PackageTest(unittest.TestCase):
 
 class BlockTest(unittest.TestCase):
 
-  def testAddImport(self):
-    module_block = _MakeModuleBlock()
-    func1_block = block.FunctionBlock(module_block, 'func1', {}, False)
-    func2_block = block.FunctionBlock(func1_block, 'func2', {}, False)
-    package = func2_block.root.add_import('foo/bar')
-    self.assertEqual(package.name, '__python__/foo/bar')
-    self.assertEqual(package.alias, 'π___python__ΓfooΓbar')
-    self.assertEqual(module_block.imports, {'__python__/foo/bar': package})
-
-  def testAddImportRepeated(self):
-    b = _MakeModuleBlock()
-    package = b.root.add_import('foo')
-    self.assertEqual(package.name, '__python__/foo')
-    self.assertEqual(package.alias, 'π___python__Γfoo')
-    self.assertEqual(b.imports, {'__python__/foo': package})
-    package2 = b.root.add_import('foo')
-    self.assertIs(package, package2)
-    self.assertEqual(b.imports, {'__python__/foo': package})
-
   def testLoop(self):
     b = _MakeModuleBlock()
-    loop = b.push_loop()
+    loop = b.push_loop(None)
     self.assertEqual(loop, b.top_loop())
-    inner_loop = b.push_loop()
+    inner_loop = b.push_loop(None)
     self.assertEqual(inner_loop, b.top_loop())
     b.pop_loop()
     self.assertEqual(loop, b.top_loop())
@@ -247,8 +226,9 @@ class FunctionBlockVisitorTest(unittest.TestCase):
 
 
 def _MakeModuleBlock():
-  return block.ModuleBlock(imputil_test.MockPath(), '__main__',
-                           '<test>', '', stmt.FutureFeatures())
+  importer = imputil.Importer(None, '__main__', '/tmp/foo.py', False)
+  return block.ModuleBlock(importer, '__main__', '<test>', '',
+                           imputil.FutureFeatures())
 
 
 def _ParseStmt(stmt_str):

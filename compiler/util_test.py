@@ -21,9 +21,8 @@ from __future__ import unicode_literals
 import unittest
 
 from grumpy.compiler import block
-from grumpy.compiler import imputil_test
+from grumpy.compiler import imputil
 from grumpy.compiler import util
-from grumpy.compiler import stmt
 
 
 class WriterTest(unittest.TestCase):
@@ -38,25 +37,12 @@ class WriterTest(unittest.TestCase):
 
   def testWriteBlock(self):
     writer = util.Writer()
-    mod_block = block.ModuleBlock(imputil_test.MockPath(), '__main__',
-                                  '<test>', '', stmt.FutureFeatures())
+    mod_block = block.ModuleBlock(None, '__main__', '<test>', '',
+                                  imputil.FutureFeatures())
     writer.write_block(mod_block, 'BODY')
     output = writer.getvalue()
     dispatch = 'switch πF.State() {\n\tcase 0:\n\tdefault: panic'
     self.assertIn(dispatch, output)
-    self.assertIn('return nil, nil\n}', output)
-
-  def testWriteImportBlockEmptyImports(self):
-    writer = util.Writer()
-    writer.write_import_block({})
-    self.assertEqual(writer.getvalue(), '')
-
-  def testWriteImportBlockImportsSorted(self):
-    writer = util.Writer()
-    imports = {name: block.Package(name) for name in ('a', 'b', 'c')}
-    writer.write_import_block(imports)
-    self.assertEqual(writer.getvalue(),
-                     'import (\n\tπ_a "a"\n\tπ_b "b"\n\tπ_c "c"\n)\n')
 
   def testWriteMultiline(self):
     writer = util.Writer()

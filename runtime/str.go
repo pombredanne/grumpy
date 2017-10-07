@@ -35,6 +35,8 @@ var (
 	strInterpolationRegexp = regexp.MustCompile(`^%([#0 +-]?)((\*|[0-9]+)?)((\.(\*|[0-9]+))?)[hlL]?([diouxXeEfFgGcrs%])`)
 	internedStrs           = map[string]*Str{}
 	caseOffset             = byte('a' - 'A')
+
+	internedName = NewStr("__name__")
 )
 
 type stripSide int
@@ -175,6 +177,19 @@ func strCapitalize(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException)
 	return NewStr(string(b)).ToObject(), nil
 }
 
+func strCenter(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
+	s, width, fill, raised := strJustDecodeArgs(f, args, "center")
+	if raised != nil {
+		return nil, raised
+	}
+	if len(s) >= width {
+		return NewStr(s).ToObject(), nil
+	}
+	marg := width - len(s)
+	left := marg/2 + (marg & width & 1)
+	return NewStr(pad(s, left, marg-left, fill)).ToObject(), nil
+}
+
 func strContains(f *Frame, o *Object, value *Object) (*Object, *BaseException) {
 	if value.isInstance(UnicodeType) {
 		decoded, raised := toStrUnsafe(o).Decode(f, EncodeDefault, EncodeStrict)
@@ -236,44 +251,9 @@ func strEq(f *Frame, v, w *Object) (*Object, *BaseException) {
 // strFind returns the lowest index in s where the substring sub is found such
 // that sub is wholly contained in s[start:end]. Return -1 on failure.
 func strFind(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
-	var raised *BaseException
-	// TODO: Support for unicode substring.
-	expectedTypes := []*Type{StrType, StrType, ObjectType, ObjectType}
-	argc := len(args)
-	if argc == 2 || argc == 3 {
-		expectedTypes = expectedTypes[:argc]
-	}
-	if raised := checkMethodArgs(f, "find/index", args, expectedTypes...); raised != nil {
-		return nil, raised
-	}
-	s := toStrUnsafe(args[0]).Value()
-	l := len(s)
-	start, end := 0, l
-	if argc >= 3 && args[2] != None {
-		start, raised = IndexInt(f, args[2])
-		if raised != nil {
-			return nil, raised
-		}
-	}
-	if argc == 4 && args[3] != None {
-		end, raised = IndexInt(f, args[3])
-		if raised != nil {
-			return nil, raised
-		}
-	}
-	if start > l {
-		return NewInt(-1).ToObject(), nil
-	}
-	start, end = adjustIndex(start, end, l)
-	if start > end {
-		return NewInt(-1).ToObject(), nil
-	}
-	sub := toStrUnsafe(args[1]).Value()
-	index := strings.Index(s[start:end], sub)
-	if index != -1 {
-		index += start
-	}
-	return NewInt(index).ToObject(), nil
+	return strFindOrIndex(f, args, func(s, sub string) (int, *BaseException) {
+		return strings.Index(s, sub), nil
+	})
 }
 
 func strGE(f *Frame, v, w *Object) (*Object, *BaseException) {
@@ -333,6 +313,16 @@ func strHash(f *Frame, o *Object) (*Object, *BaseException) {
 	h := NewInt(hashString(toStrUnsafe(o).Value()))
 	atomic.StorePointer(p, unsafe.Pointer(h))
 	return h.ToObject(), nil
+}
+
+func strIndex(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+	return strFindOrIndex(f, args, func(s, sub string) (i int, raised *BaseException) {
+		i = strings.Index(s, sub)
+		if i == -1 {
+			raised = f.RaiseType(ValueErrorType, "substring not found")
+		}
+		return i, raised
+	})
 }
 
 func strIsAlNum(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
@@ -527,6 +517,17 @@ func strLen(f *Frame, o *Object) (*Object, *BaseException) {
 	return NewInt(len(toStrUnsafe(o).Value())).ToObject(), nil
 }
 
+func strLJust(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
+	s, width, fill, raised := strJustDecodeArgs(f, args, "ljust")
+	if raised != nil {
+		return nil, raised
+	}
+	if len(s) >= width {
+		return NewStr(s).ToObject(), nil
+	}
+	return NewStr(pad(s, 0, width-len(s), fill)).ToObject(), nil
+}
+
 func strLower(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
 	expectedTypes := []*Type{StrType}
 	if raised := checkMethodArgs(f, "lower", args, expectedTypes...); raised != nil {
@@ -704,6 +705,33 @@ func strRepr(_ *Frame, o *Object) (*Object, *BaseException) {
 	}
 	buf.WriteRune('\'')
 	return NewStr(buf.String()).ToObject(), nil
+}
+
+func strRFind(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+	return strFindOrIndex(f, args, func(s, sub string) (int, *BaseException) {
+		return strings.LastIndex(s, sub), nil
+	})
+}
+
+func strRIndex(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+	return strFindOrIndex(f, args, func(s, sub string) (i int, raised *BaseException) {
+		i = strings.LastIndex(s, sub)
+		if i == -1 {
+			raised = f.RaiseType(ValueErrorType, "substring not found")
+		}
+		return i, raised
+	})
+}
+
+func strRJust(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
+	s, width, fill, raised := strJustDecodeArgs(f, args, "rjust")
+	if raised != nil {
+		return nil, raised
+	}
+	if len(s) >= width {
+		return NewStr(s).ToObject(), nil
+	}
+	return NewStr(pad(s, width-len(s), 0, fill)).ToObject(), nil
 }
 
 func strSplit(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
@@ -908,9 +936,11 @@ func initStrType(dict map[string]*Object) {
 	dict["__getnewargs__"] = newBuiltinFunction("__getnewargs__", strGetNewArgs).ToObject()
 	dict["capitalize"] = newBuiltinFunction("capitalize", strCapitalize).ToObject()
 	dict["count"] = newBuiltinFunction("count", strCount).ToObject()
+	dict["center"] = newBuiltinFunction("center", strCenter).ToObject()
 	dict["decode"] = newBuiltinFunction("decode", strDecode).ToObject()
 	dict["endswith"] = newBuiltinFunction("endswith", strEndsWith).ToObject()
 	dict["find"] = newBuiltinFunction("find", strFind).ToObject()
+	dict["index"] = newBuiltinFunction("index", strIndex).ToObject()
 	dict["isalnum"] = newBuiltinFunction("isalnum", strIsAlNum).ToObject()
 	dict["isalpha"] = newBuiltinFunction("isalpha", strIsAlpha).ToObject()
 	dict["isdigit"] = newBuiltinFunction("isdigit", strIsDigit).ToObject()
@@ -920,7 +950,11 @@ func initStrType(dict map[string]*Object) {
 	dict["isupper"] = newBuiltinFunction("isupper", strIsUpper).ToObject()
 	dict["join"] = newBuiltinFunction("join", strJoin).ToObject()
 	dict["lower"] = newBuiltinFunction("lower", strLower).ToObject()
+	dict["ljust"] = newBuiltinFunction("ljust", strLJust).ToObject()
 	dict["lstrip"] = newBuiltinFunction("lstrip", strLStrip).ToObject()
+	dict["rfind"] = newBuiltinFunction("rfind", strRFind).ToObject()
+	dict["rindex"] = newBuiltinFunction("rindex", strRIndex).ToObject()
+	dict["rjust"] = newBuiltinFunction("rjust", strRJust).ToObject()
 	dict["split"] = newBuiltinFunction("split", strSplit).ToObject()
 	dict["splitlines"] = newBuiltinFunction("splitlines", strSplitLines).ToObject()
 	dict["startswith"] = newBuiltinFunction("startswith", strStartsWith).ToObject()
@@ -1306,6 +1340,29 @@ func isUpper(c byte) bool {
 	return 'A' <= c && c <= 'Z'
 }
 
+func pad(s string, left int, right int, fillchar string) string {
+	buf := bytes.Buffer{}
+
+	if left < 0 {
+		left = 0
+	}
+
+	if right < 0 {
+		right = 0
+	}
+
+	if left == 0 && right == 0 {
+		return s
+	}
+
+	buf.Grow(left + len(s) + right)
+	buf.WriteString(strings.Repeat(fillchar, left))
+	buf.WriteString(s)
+	buf.WriteString(strings.Repeat(fillchar, right))
+
+	return buf.String()
+}
+
 // strLeftPad returns s padded with fillchar so that its length is at least width.
 // Fillchar must be a single character. When fillchar is "0", s starting with a
 // sign are handled correctly.
@@ -1326,4 +1383,67 @@ func strLeftPad(s string, width int, fillchar string) string {
 	buf.WriteString(strings.Repeat(fillchar, width-l))
 	buf.WriteString(s)
 	return buf.String()
+}
+
+type indexFunc func(string, string) (int, *BaseException)
+
+func strFindOrIndex(f *Frame, args Args, fn indexFunc) (*Object, *BaseException) {
+	// TODO: Support for unicode substring.
+	expectedTypes := []*Type{StrType, StrType, ObjectType, ObjectType}
+	argc := len(args)
+	if argc == 2 || argc == 3 {
+		expectedTypes = expectedTypes[:argc]
+	}
+	if raised := checkMethodArgs(f, "find/index", args, expectedTypes...); raised != nil {
+		return nil, raised
+	}
+	s := toStrUnsafe(args[0]).Value()
+	l := len(s)
+	start, end := 0, l
+	var raised *BaseException
+	if argc >= 3 && args[2] != None {
+		start, raised = IndexInt(f, args[2])
+		if raised != nil {
+			return nil, raised
+		}
+	}
+	if argc == 4 && args[3] != None {
+		end, raised = IndexInt(f, args[3])
+		if raised != nil {
+			return nil, raised
+		}
+	}
+	// Default to an impossible search.
+	search, sub := "", "-"
+	if start <= l {
+		start, end = adjustIndex(start, end, l)
+		if start <= end {
+			sub = toStrUnsafe(args[1]).Value()
+			search = s[start:end]
+		}
+	}
+	index, raised := fn(search, sub)
+	if raised != nil {
+		return nil, raised
+	}
+	if index != -1 {
+		index += start
+	}
+	return NewInt(index).ToObject(), nil
+}
+
+func strJustDecodeArgs(f *Frame, args Args, name string) (string, int, string, *BaseException) {
+	expectedTypes := []*Type{StrType, IntType, StrType}
+	if raised := checkMethodArgs(f, name, args, expectedTypes...); raised != nil {
+		return "", 0, "", raised
+	}
+	s := toStrUnsafe(args[0]).Value()
+	width := toIntUnsafe(args[1]).Value()
+	fill := toStrUnsafe(args[2]).Value()
+
+	if numChars := len(fill); numChars != 1 {
+		return s, width, fill, f.RaiseType(TypeErrorType, fmt.Sprintf("%[1]s() argument 2 must be char, not str", name))
+	}
+
+	return s, width, fill, nil
 }

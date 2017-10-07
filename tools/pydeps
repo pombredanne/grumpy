@@ -20,8 +20,6 @@ import argparse
 import os
 import sys
 
-import pythonparser
-
 from grumpy.compiler import imputil
 from grumpy.compiler import util
 
@@ -36,28 +34,29 @@ def main(args):
   if not gopath:
     print >> sys.stderr, 'GOPATH not set'
     return 1
-  path = imputil.Path(gopath, args.modname, args.script)
 
-  with open(args.script) as py_file:
-    py_contents = py_file.read()
   try:
-    mod = pythonparser.parse(py_contents)
+    imports = imputil.collect_imports(args.modname, args.script, gopath)
   except SyntaxError as e:
     print >> sys.stderr, '{}: line {}: invalid syntax: {}'.format(
         e.filename, e.lineno, e.text)
     return 2
-
-  visitor = imputil.ImportVisitor(path)
-  try:
-    visitor.visit(mod)
   except util.CompileError as e:
     print >> sys.stderr, str(e)
     return 2
-  imports = set()
-  for imp in visitor.imports:
-    if not imp.is_native and imp.name not in imports:
-      imports.add(imp.name)
+
+  names = set([args.modname])
+  for imp in imports:
+    if imp.is_native:
       print imp.name
+    else:
+      parts = imp.name.split('.')
+      # Iterate over all packages and the leaf module.
+      for i in xrange(len(parts)):
+        name = '.'.join(parts[:i+1])
+        if name not in names:
+          names.add(name)
+          print name
 
 
 if __name__ == '__main__':

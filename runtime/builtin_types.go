@@ -104,6 +104,7 @@ var builtinTypes = map[*Type]*builtinTypeInfo{
 	BaseExceptionType:             {init: initBaseExceptionType, global: true},
 	BaseStringType:                {init: initBaseStringType, global: true},
 	BoolType:                      {init: initBoolType, global: true},
+	ByteArrayType:                 {init: initByteArrayType, global: true},
 	BytesWarningType:              {global: true},
 	CodeType:                      {},
 	ComplexType:                   {init: initComplexType, global: true},
@@ -130,6 +131,7 @@ var builtinTypes = map[*Type]*builtinTypeInfo{
 	IndexErrorType:                {global: true},
 	IntType:                       {init: initIntType, global: true},
 	IOErrorType:                   {global: true},
+	KeyboardInterruptType:         {global: true},
 	KeyErrorType:                  {global: true},
 	listIteratorType:              {init: initListIteratorType},
 	ListType:                      {init: initListType, global: true},
@@ -340,20 +342,26 @@ func builtinDir(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
 	}
 	d := NewDict()
 	o := args[0]
-	if o.dict != nil {
-		raised := seqForEach(f, o.dict.ToObject(), func(k *Object) *BaseException {
-			return d.SetItem(f, k, None)
-		})
-		if raised != nil {
-			return nil, raised
+	switch {
+	case o.isInstance(TypeType):
+		for _, t := range toTypeUnsafe(o).mro {
+			if raised := d.Update(f, t.Dict().ToObject()); raised != nil {
+				return nil, raised
+			}
 		}
-	}
-	for _, t := range o.typ.mro {
-		raised := seqForEach(f, t.dict.ToObject(), func(k *Object) *BaseException {
-			return d.SetItem(f, k, None)
-		})
-		if raised != nil {
-			return nil, raised
+	case o.isInstance(ModuleType):
+		d.Update(f, o.Dict().ToObject())
+	default:
+		d = NewDict()
+		if dict := o.Dict(); dict != nil {
+			if raised := d.Update(f, dict.ToObject()); raised != nil {
+				return nil, raised
+			}
+		}
+		for _, t := range o.typ.mro {
+			if raised := d.Update(f, t.Dict().ToObject()); raised != nil {
+				return nil, raised
+			}
 		}
 	}
 	l := d.Keys(f)
@@ -631,15 +639,27 @@ func builtinRound(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
 			return nil, raised
 		}
 	}
-	// TODO: implement this.
-	if ndigits != 0 {
-		return nil, f.RaiseType(NotImplementedErrorType, "round with ndigits is not implemented in grumpy")
-	}
 	number, isFloat := floatCoerce(args[0])
+
 	if !isFloat {
 		return nil, f.RaiseType(TypeErrorType, "a float is required")
 	}
-	return NewFloat(math.Floor(number + 0.5)).ToObject(), nil
+
+	if math.IsNaN(number) || math.IsInf(number, 0) || number == 0.0 {
+		return NewFloat(number).ToObject(), nil
+	}
+
+	neg := false
+	if number < 0 {
+		neg = true
+		number = -number
+	}
+	pow := math.Pow(10.0, float64(ndigits))
+	result := math.Floor(number*pow+0.5) / pow
+	if neg {
+		result = -result
+	}
+	return NewFloat(result).ToObject(), nil
 }
 
 func builtinSetAttr(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
@@ -659,6 +679,35 @@ func builtinSorted(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
 		return nil, raised
 	}
 	toListUnsafe(result).Sort(f)
+	return result, nil
+}
+
+func builtinSum(f *Frame, args Args, _ KWArgs) (*Object, *BaseException) {
+	argc := len(args)
+	expectedTypes := []*Type{ObjectType, ObjectType}
+	if argc == 1 {
+		expectedTypes = expectedTypes[:1]
+	}
+	if raised := checkFunctionArgs(f, "sum", args, expectedTypes...); raised != nil {
+		return nil, raised
+	}
+	var result *Object
+	if argc > 1 {
+		if args[1].typ == StrType {
+			return nil, f.RaiseType(TypeErrorType, "sum() can't sum strings [use ''.join(seq) instead]")
+		}
+		result = args[1]
+	} else {
+		result = NewInt(0).ToObject()
+	}
+	raised := seqForEach(f, args[0], func(o *Object) (raised *BaseException) {
+		result, raised = Add(f, result, o)
+		return raised
+	})
+
+	if raised != nil {
+		return nil, raised
+	}
 	return result, nil
 }
 
@@ -691,9 +740,9 @@ Outer:
 			elem, raised := Next(f, iter)
 			if raised != nil {
 				if raised.isInstance(StopIterationType) {
+					f.RestoreExc(nil, nil)
 					break Outer
 				}
-				f.RestoreExc(nil, nil)
 				return nil, raised
 			}
 			elems[i] = elem
@@ -705,6 +754,7 @@ Outer:
 
 func init() {
 	builtinMap := map[string]*Object{
+		"__debug__":      False.ToObject(),
 		"__frame__":      newBuiltinFunction("__frame__", builtinFrame).ToObject(),
 		"abs":            newBuiltinFunction("abs", builtinAbs).ToObject(),
 		"all":            newBuiltinFunction("all", builtinAll).ToObject(),
@@ -744,6 +794,7 @@ func init() {
 		"round":          newBuiltinFunction("round", builtinRound).ToObject(),
 		"setattr":        newBuiltinFunction("setattr", builtinSetAttr).ToObject(),
 		"sorted":         newBuiltinFunction("sorted", builtinSorted).ToObject(),
+		"sum":            newBuiltinFunction("sum", builtinSum).ToObject(),
 		"True":           True.ToObject(),
 		"unichr":         newBuiltinFunction("unichr", builtinUniChr).ToObject(),
 		"zip":            newBuiltinFunction("zip", builtinZip).ToObject(),
@@ -887,9 +938,9 @@ func zipLongest(f *Frame, args Args) ([][]*Object, *BaseException) {
 				if raised.isInstance(StopIterationType) {
 					iters[i] = nil
 					elems[i] = None
+					f.RestoreExc(nil, nil)
 					continue
 				}
-				f.RestoreExc(nil, nil)
 				return nil, raised
 			}
 			noItems = false

@@ -51,6 +51,13 @@ class ImportError(CompileError):  # pylint: disable=redefined-builtin
   pass
 
 
+class LateFutureError(ImportError):
+
+  def __init__(self, node):
+    msg = 'from __future__ imports must occur at the beginning of the file'
+    super(LateFutureError, self).__init__(node, msg)
+
+
 class Writer(object):
   """Utility class for writing blocks of Go code to a file-like object."""
 
@@ -80,7 +87,6 @@ class Writer(object):
       block_: The Block object representing the code block.
       body: String containing Go code making up the body of the code block.
     """
-    self.write('var πE *πg.BaseException; _ = πE')
     self.write('for ; πF.State() >= 0; πF.PopCheckpoint() {')
     with self.indent_block():
       self.write('switch πF.State() {')
@@ -92,18 +98,7 @@ class Writer(object):
       # Assume that body is aligned with goto labels.
       with self.indent_block(-1):
         self.write(body)
-      self.write('return nil, nil')
     self.write('}')
-    self.write('return nil, πE')
-
-  def write_import_block(self, imports):
-    if not imports:
-      return
-    self.write('import (')
-    with self.indent_block():
-      for name in sorted(imports):
-        self.write('{} "{}"'.format(imports[name].alias, name))
-    self.write(')')
 
   def write_label(self, label):
     with self.indent_block(-1):

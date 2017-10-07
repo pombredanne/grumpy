@@ -21,14 +21,13 @@ from __future__ import unicode_literals
 import string
 import textwrap
 
-from pythonparser import algorithm
-from pythonparser import ast
-
 from grumpy.compiler import block
 from grumpy.compiler import expr
 from grumpy.compiler import expr_visitor
 from grumpy.compiler import imputil
 from grumpy.compiler import util
+from grumpy.pythonparser import algorithm
+from grumpy.pythonparser import ast
 
 
 _NATIVE_TYPE_PREFIX = 'type_'
@@ -44,103 +43,14 @@ _KNOWN_VCS = [
 _nil_expr = expr.nil_expr
 
 
-# Parser flags, set on 'from __future__ import *', see parser_flags on
-# StatementVisitor below. Note these have the same values as CPython.
-FUTURE_DIVISION = 0x2000
-FUTURE_ABSOLUTE_IMPORT = 0x4000
-FUTURE_PRINT_FUNCTION = 0x10000
-FUTURE_UNICODE_LITERALS = 0x20000
-
-# Names for future features in 'from __future__ import *'. Map from name in the
-# import statement to a tuple of the flag for parser, and whether we've (grumpy)
-# implemented the feature yet.
-future_features = {
-    "division": (FUTURE_DIVISION, False),
-    "absolute_import": (FUTURE_ABSOLUTE_IMPORT, False),
-    "print_function": (FUTURE_PRINT_FUNCTION, True),
-    "unicode_literals": (FUTURE_UNICODE_LITERALS, False),
-}
-
-# These future features are already in the language proper as of 2.6, so
-# importing them via __future__ has no effect.
-redundant_future_features = ["generators", "with_statement", "nested_scopes"]
-
-late_future = 'from __future__ imports must occur at the beginning of the file'
-
-
-def import_from_future(node):
-  """Processes a future import statement, returning set of flags it defines."""
-  assert isinstance(node, ast.ImportFrom)
-  assert node.module == '__future__'
-  flags = 0
-  for alias in node.names:
-    name = alias.name
-    if name in future_features:
-      flag, implemented = future_features[name]
-      if not implemented:
-        msg = 'future feature {} not yet implemented by grumpy'.format(name)
-        raise util.ParseError(node, msg)
-      flags |= flag
-    elif name == 'braces':
-      raise util.ParseError(node, 'not a chance')
-    elif name not in redundant_future_features:
-      msg = 'future feature {} is not defined'.format(name)
-      raise util.ParseError(node, msg)
-  return flags
-
-
-class FutureFeatures(object):
-  def __init__(self):
-    self.parser_flags = 0
-    self.future_lineno = 0
-
-
-def visit_future(node):
-  """Accumulates a set of compiler flags for the compiler __future__ imports.
-
-  Returns an instance of FutureFeatures which encapsulates the flags and the
-  line number of the last valid future import parsed. A downstream parser can
-  use the latter to detect invalid future imports that appear too late in the
-  file.
-  """
-  # If this is the module node, do an initial pass through the module body's
-  # statements to detect future imports and process their directives (i.e.,
-  # set compiler flags), and detect ones that don't appear at the beginning of
-  # the file. The only things that can proceed a future statement are other
-  # future statements and/or a doc string.
-  assert isinstance(node, ast.Module)
-  ff = FutureFeatures()
-  done = False
-  found_docstring = False
-  for node in node.body:
-    if isinstance(node, ast.ImportFrom):
-      modname = node.module
-      if modname == '__future__':
-        if done:
-          raise util.ParseError(node, late_future)
-        ff.parser_flags |= import_from_future(node)
-        ff.future_lineno = node.lineno
-      else:
-        done = True
-    elif isinstance(node, ast.Expr) and not found_docstring:
-      e = node.value
-      if not isinstance(e, ast.Str): # pylint: disable=simplifiable-if-statement
-        done = True
-      else:
-        found_docstring = True
-    else:
-      done = True
-  return ff
-
-
 class StatementVisitor(algorithm.Visitor):
   """Outputs Go statements to a Writer for the given Python nodes."""
 
   # pylint: disable=invalid-name,missing-docstring
 
-  def __init__(self, block_):
+  def __init__(self, block_, future_node=None):
     self.block = block_
-    self.future_features = self.block.root.future_features or FutureFeatures()
+    self.future_node = future_node
     self.writer = util.Writer()
     self.expr_visitor = expr_visitor.ExprVisitor(self)
 
@@ -183,7 +93,9 @@ class StatementVisitor(algorithm.Visitor):
     if not self.block.loop_stack:
       raise util.ParseError(node, "'break' not in loop")
     self._write_py_context(node.lineno)
-    self.writer.write('goto Label{}'.format(self.block.top_loop().end_label))
+    self.writer.write_tmpl(textwrap.dedent("""\
+        $breakvar = true
+        continue"""), breakvar=self.block.top_loop().breakvar.name)
 
   def visit_ClassDef(self, node):
     # Since we only care about global vars, we end up throwing away the locals
@@ -196,7 +108,7 @@ class StatementVisitor(algorithm.Visitor):
                    if v.type == block.Var.TYPE_GLOBAL}
     # Visit all the statements inside body of the class definition.
     body_visitor = StatementVisitor(block.ClassBlock(
-        self.block, node.name, global_vars))
+        self.block, node.name, global_vars), self.future_node)
     # Indent so that the function body is aligned with the goto labels.
     with body_visitor.writer.indent_block():
       body_visitor._visit_each(node.body)  # pylint: disable=protected-access
@@ -229,6 +141,7 @@ class StatementVisitor(algorithm.Visitor):
         self.writer.write_temp_decls(body_visitor.block)
         self.writer.write_block(body_visitor.block,
                                 body_visitor.writer.getvalue())
+        self.writer.write('return nil, nil')
       tmpl = textwrap.dedent("""\
           }).Eval(πF, πF.Globals(), nil, nil)
           if πE != nil {
@@ -255,7 +168,7 @@ class StatementVisitor(algorithm.Visitor):
     if not self.block.loop_stack:
       raise util.ParseError(node, "'continue' not in loop")
     self._write_py_context(node.lineno)
-    self.writer.write('goto Label{}'.format(self.block.top_loop().start_label))
+    self.writer.write('continue')
 
   def visit_Delete(self, node):
     self._write_py_context(node.lineno)
@@ -281,40 +194,27 @@ class StatementVisitor(algorithm.Visitor):
     self.visit_expr(node.value).free()
 
   def visit_For(self, node):
-    loop = self.block.push_loop()
-    orelse_label = self.block.genlabel() if node.orelse else loop.end_label
-    self._write_py_context(node.lineno)
-    with self.visit_expr(node.iter) as iter_expr, \
-        self.block.alloc_temp() as i, \
-        self.block.alloc_temp() as n:
-      self.writer.write_checked_call2(i, 'πg.Iter(πF, {})', iter_expr.expr)
-      self.writer.write_label(loop.start_label)
-      tmpl = textwrap.dedent("""\
-          if $n, πE = πg.Next(πF, $i); πE != nil {
-          \tisStop, exc := πg.IsInstance(πF, πE.ToObject(), πg.StopIterationType.ToObject())
-          \tif exc != nil {
-          \t\tπE = exc
-          \t\tcontinue
-          \t}
-          \tif !isStop {
-          \t\tcontinue
-          \t}
-          \tπE = nil
-          \tπF.RestoreExc(nil, nil)
-          \tgoto Label$orelse
-          }""")
-      self.writer.write_tmpl(tmpl, n=n.name, i=i.expr, orelse=orelse_label)
-      self._tie_target(node.target, n.expr)
-      self._visit_each(node.body)
-      self.writer.write('goto Label{}'.format(loop.start_label))
-
-    self.block.pop_loop()
-    if node.orelse:
-      self.writer.write_label(orelse_label)
-      self._visit_each(node.orelse)
-    # Avoid label "defined and not used" in case there's no break statements.
-    self.writer.write('goto Label{}'.format(loop.end_label))
-    self.writer.write_label(loop.end_label)
+    with self.block.alloc_temp() as i:
+      with self.visit_expr(node.iter) as iter_expr:
+        self.writer.write_checked_call2(i, 'πg.Iter(πF, {})', iter_expr.expr)
+      def testfunc(testvar):
+        with self.block.alloc_temp() as n:
+          self.writer.write_tmpl(textwrap.dedent("""\
+              if $n, πE = πg.Next(πF, $i); πE != nil {
+              \tisStop, exc := πg.IsInstance(πF, πE.ToObject(), πg.StopIterationType.ToObject())
+              \tif exc != nil {
+              \t\tπE = exc
+              \t} else if isStop {
+              \t\tπE = nil
+              \t\tπF.RestoreExc(nil, nil)
+              \t}
+              \t$testvar = !isStop
+              } else {
+              \t$testvar = true"""), n=n.name, i=i.expr, testvar=testvar.name)
+          with self.writer.indent_block():
+            self._tie_target(node.target, n.expr)
+          self.writer.write('}')
+      self._visit_loop(testfunc, node)
 
   def visit_FunctionDef(self, node):
     self._write_py_context(node.lineno + len(node.decorator_list))
@@ -374,43 +274,17 @@ class StatementVisitor(algorithm.Visitor):
 
   def visit_Import(self, node):
     self._write_py_context(node.lineno)
-    visitor = imputil.ImportVisitor(self.block.root.path)
-    visitor.visit(node)
-    for imp in visitor.imports:
+    for imp in self.block.root.importer.visit(node):
       self._import_and_bind(imp)
 
   def visit_ImportFrom(self, node):
     self._write_py_context(node.lineno)
-    visitor = imputil.ImportVisitor(self.block.root.path)
-    visitor.visit(node)
-    for imp in visitor.imports:
-      if imp.is_native:
-        values = [b.value for b in imp.bindings]
-        with self._import_native(imp.name, values) as mod:
-          for binding in imp.bindings:
-            # Strip the 'type_' prefix when populating the module. This means
-            # that, e.g. 'from __go__.foo import type_Bar' will populate foo
-            # with a member called Bar, not type_Bar (although the symbol in
-            # the importing module will still be type_Bar unless aliased). This
-            # bends the semantics of import but makes native module contents
-            # more sensible.
-            name = binding.value
-            if name.startswith(_NATIVE_TYPE_PREFIX):
-              name = name[len(_NATIVE_TYPE_PREFIX):]
-            with self.block.alloc_temp() as member:
-              self.writer.write_checked_call2(
-                  member, 'πg.GetAttr(πF, {}, {}, nil)',
-                  mod.expr, self.block.root.intern(name))
-              self.block.bind_var(
-                  self.writer, binding.alias, member.expr)
-      elif node.module == '__future__':
-        # At this stage all future imports are done in an initial pass (see
-        # visit() above), so if they are encountered here after the last valid
-        # __future__ then it's a syntax error.
-        if node.lineno > self.future_features.future_lineno:
-          raise util.ImportError(node, late_future)
-      else:
-        self._import_and_bind(imp)
+
+    if node.module == '__future__' and node != self.future_node:
+      raise util.LateFutureError(node)
+
+    for imp in self.block.root.importer.visit(node):
+      self._import_and_bind(imp)
 
   def visit_Module(self, node):
     self._visit_each(node.body)
@@ -419,7 +293,7 @@ class StatementVisitor(algorithm.Visitor):
     self._write_py_context(node.lineno)
 
   def visit_Print(self, node):
-    if self.future_features.parser_flags & FUTURE_PRINT_FUNCTION:
+    if self.block.root.future_features.print_function:
       raise util.ParseError(node, 'syntax error (print is not a keyword)')
     self._write_py_context(node.lineno)
     with self.block.alloc_temp('[]*πg.Object') as args:
@@ -451,9 +325,10 @@ class StatementVisitor(algorithm.Visitor):
       raise util.ParseError(node, 'returning a value in a generator function')
     if node.value:
       with self.visit_expr(node.value) as value:
-        self.writer.write('return {}, nil'.format(value.expr))
+        self.writer.write('πR = {}'.format(value.expr))
     else:
-      self.writer.write('return nil, nil')
+      self.writer.write('πR = πg.None')
+    self.writer.write('continue')
 
   def visit_Try(self, node):
     # The general structure generated by this method is shown below:
@@ -500,32 +375,28 @@ class StatementVisitor(algorithm.Visitor):
 
     with self.block.alloc_temp('*πg.BaseException') as exc:
       if except_label:
-        if (len(node.handlers) == 1 and not node.handlers[0].type and
-            not node.orelse):
-          # When there's just a bare except, no dispatch is required.
-          self._write_except_block(except_label, exc.expr, node.handlers[0])
+        with self.block.alloc_temp('*πg.Traceback') as tb:
+          self.writer.write_label(except_label)
+          self.writer.write_tmpl(textwrap.dedent("""\
+              if πE == nil {
+                continue
+              }
+              πE = nil
+              $exc, $tb = πF.ExcInfo()"""), exc=exc.expr, tb=tb.expr)
+          handler_labels = self._write_except_dispatcher(
+              exc.expr, tb.expr, node.handlers)
+
+        # Write the bodies of each of the except handlers.
+        for handler_label, except_node in zip(handler_labels, node.handlers):
+          self._write_except_block(handler_label, exc.expr, except_node)
           if node.finalbody:
             self.writer.write('πF.PopCheckpoint()')  # finally_label
           self.writer.write('goto Label{}'.format(finally_label))
-        else:
-          with self.block.alloc_temp('*πg.Traceback') as tb:
-            self.writer.write_label(except_label)
-            self.writer.write('{}, {} = πF.ExcInfo()'.format(exc.expr, tb.expr))
-            handler_labels = self._write_except_dispatcher(
-                exc.expr, tb.expr, node.handlers)
-
-          # Write the bodies of each of the except handlers.
-          for handler_label, except_node in zip(handler_labels, node.handlers):
-            self._write_except_block(handler_label, exc.expr, except_node)
-            if node.finalbody:
-              self.writer.write('πF.PopCheckpoint()')  # finally_label
-            self.writer.write('goto Label{}'.format(finally_label))
 
       # Write the finally body.
       self.writer.write_label(finally_label)
       if node.finalbody:
         with self.block.alloc_temp('*πg.Traceback') as tb:
-          self.writer.write('πE = nil')
           self.writer.write('{}, {} = πF.RestoreExc(nil, nil)'.format(
               exc.expr, tb.expr))
           self._visit_each(node.finalbody)
@@ -533,29 +404,18 @@ class StatementVisitor(algorithm.Visitor):
               if $exc != nil {
               \tπE = πF.Raise($exc.ToObject(), nil, $tb.ToObject())
               \tcontinue
+              }
+              if πR != nil {
+              \tcontinue
               }"""), exc=exc.expr, tb=tb.expr)
 
   def visit_While(self, node):
-    loop = self.block.push_loop()
     self._write_py_context(node.lineno)
-    self.writer.write_label(loop.start_label)
-    orelse_label = self.block.genlabel() if node.orelse else loop.end_label
-    with self.visit_expr(node.test) as cond,\
-        self.block.alloc_temp('bool') as is_true:
-      self.writer.write_checked_call2(is_true, 'πg.IsTrue(πF, {})', cond.expr)
-      self.writer.write_tmpl(textwrap.dedent("""\
-          if !$is_true {
-          \tgoto Label$orelse_label
-          }"""), is_true=is_true.expr, orelse_label=orelse_label)
-      self._visit_each(node.body)
-      self.writer.write('goto Label{}'.format(loop.start_label))
-    if node.orelse:
-      self.writer.write_label(orelse_label)
-      self._visit_each(node.orelse)
-    # Avoid label "defined and not used" in case there's no break statements.
-    self.writer.write('goto Label{}'.format(loop.end_label))
-    self.writer.write_label(loop.end_label)
-    self.block.pop_loop()
+    def testfunc(testvar):
+      with self.visit_expr(node.test) as cond:
+        self.writer.write_checked_call2(
+            testvar, 'πg.IsTrue(πF, {})', cond.expr)
+    self._visit_loop(testfunc, node)
 
   def visit_With(self, node):
     assert len(node.items) == 1, 'multiple items in a with not yet supported'
@@ -599,7 +459,10 @@ class StatementVisitor(algorithm.Visitor):
           self.block.alloc_temp('*πg.Type') as t:
         # temp := exit(mgr, *sys.exec_info())
         tmpl = """\
-            $exc, $tb = πF.ExcInfo()
+            $exc, $tb = nil, nil
+            if πE != nil {
+            \t$exc, $tb = πF.ExcInfo()
+            }
             if $exc != nil {
             \t$t = $exc.Type()
             \tif $swallow_exc, πE = $exit_func.Call(πF, πg.Args{$mgr, $t.ToObject(), $exc.ToObject(), $tb.ToObject()}, nil); πE != nil {
@@ -625,6 +488,9 @@ class StatementVisitor(algorithm.Visitor):
             if $exc != nil && $swallow_exc != true {
             \tπE = πF.Raise(nil, nil, nil)
             \tcontinue
+            }
+            if πR != nil {
+            \tcontinue
             }"""), exc=exc.expr, swallow_exc=swallow_exc_bool.expr)
 
   def visit_function_inline(self, node):
@@ -637,7 +503,7 @@ class StatementVisitor(algorithm.Visitor):
       func_visitor.visit(child)
     func_block = block.FunctionBlock(self.block, node.name, func_visitor.vars,
                                      func_visitor.is_generator)
-    visitor = StatementVisitor(func_block)
+    visitor = StatementVisitor(func_block, self.future_node)
     # Indent so that the function body is aligned with the goto labels.
     with visitor.writer.indent_block():
       visitor._visit_each(node.body)  # pylint: disable=protected-access
@@ -677,14 +543,25 @@ class StatementVisitor(algorithm.Visitor):
             self.writer.write(fmt.format(
                 util.adjust_local_name(var.name), var.init_expr))
         self.writer.write_temp_decls(func_block)
+        self.writer.write('var πR *πg.Object; _ = πR')
+        self.writer.write('var πE *πg.BaseException; _ = πE')
         if func_block.is_generator:
-          self.writer.write('return πg.NewGenerator(πF, func(πSent *πg.Object) '
-                            '(*πg.Object, *πg.BaseException) {')
+          self.writer.write(
+              'return πg.NewGenerator(πF, func(πSent *πg.Object) '
+              '(*πg.Object, *πg.BaseException) {')
           with self.writer.indent_block():
             self.writer.write_block(func_block, visitor.writer.getvalue())
+            self.writer.write('return nil, πE')
           self.writer.write('}).ToObject(), nil')
         else:
           self.writer.write_block(func_block, visitor.writer.getvalue())
+          self.writer.write(textwrap.dedent("""\
+              if πE != nil {
+              \tπR = nil
+              } else if πR == nil {
+              \tπR = πg.None
+              }
+              return πR, πE"""))
       self.writer.write('}), πF.Globals()).ToObject()')
     return result
 
@@ -692,10 +569,12 @@ class StatementVisitor(algorithm.Visitor):
       ast.Add: 'πg.IAdd(πF, {lhs}, {rhs})',
       ast.BitAnd: 'πg.IAnd(πF, {lhs}, {rhs})',
       ast.Div: 'πg.IDiv(πF, {lhs}, {rhs})',
+      ast.FloorDiv: 'πg.IFloorDiv(πF, {lhs}, {rhs})',
       ast.LShift: 'πg.ILShift(πF, {lhs}, {rhs})',
       ast.Mod: 'πg.IMod(πF, {lhs}, {rhs})',
       ast.Mult: 'πg.IMul(πF, {lhs}, {rhs})',
       ast.BitOr: 'πg.IOr(πF, {lhs}, {rhs})',
+      ast.Pow: 'πg.IPow(πF, {lhs}, {rhs})',
       ast.RShift: 'πg.IRShift(πF, {lhs}, {rhs})',
       ast.Sub: 'πg.ISub(πF, {lhs}, {rhs})',
       ast.BitXor: 'πg.IXor(πF, {lhs}, {rhs})',
@@ -739,74 +618,26 @@ class StatementVisitor(algorithm.Visitor):
     """
     # Acquire handles to the Code objects in each Go package and call
     # ImportModule to initialize all modules.
-    parts = imp.name.split('.')
-    code_objs = []
-    for i in xrange(len(parts)):
-      package_name = '/'.join(parts[:i + 1])
-      if package_name != self.block.root.full_package_name:
-        package = self.block.root.add_import(package_name)
-        code_objs.append('{}.Code'.format(package.alias))
-      else:
-        code_objs.append('Code')
     with self.block.alloc_temp() as mod, \
         self.block.alloc_temp('[]*πg.Object') as mod_slice:
-      handles_expr = '[]*πg.Code{' + ', '.join(code_objs) + '}'
       self.writer.write_checked_call2(
-          mod_slice, 'πg.ImportModule(πF, {}, {})',
-          util.go_str(imp.name), handles_expr)
+          mod_slice, 'πg.ImportModule(πF, {})', util.go_str(imp.name))
 
       # Bind the imported modules or members to variables in the current scope.
       for binding in imp.bindings:
-        self.writer.write('{} = {}[{}]'.format(
-            mod.name, mod_slice.expr, imp.name.count('.')))
         if binding.bind_type == imputil.Import.MODULE:
+          self.writer.write('{} = {}[{}]'.format(
+              mod.name, mod_slice.expr, binding.value))
           self.block.bind_var(self.writer, binding.alias, mod.expr)
         else:
+          self.writer.write('{} = {}[{}]'.format(
+              mod.name, mod_slice.expr, imp.name.count('.')))
           # Binding a member of the imported module.
           with self.block.alloc_temp() as member:
             self.writer.write_checked_call2(
                 member, 'πg.GetAttr(πF, {}, {}, nil)',
                 mod.expr, self.block.root.intern(binding.value))
             self.block.bind_var(self.writer, binding.alias, member.expr)
-
-  def _import_native(self, name, values):
-    reflect_package = self.block.root.add_native_import('reflect')
-    # Work-around for importing go module from VCS
-    # TODO: support bzr|git|hg|svn from any server
-    package_name = None
-    for x in _KNOWN_VCS:
-      if name.startswith(x):
-        package_name = x + name[len(x):].replace('.', '/')
-        break
-    if not package_name:
-      package_name = name.replace('.', '/')
-
-    package = self.block.root.add_native_import(package_name)
-    mod = self.block.alloc_temp()
-    with self.block.alloc_temp('map[string]*πg.Object') as members:
-      self.writer.write_tmpl('$members = map[string]*πg.Object{}',
-                             members=members.name)
-      for v in values:
-        module_attr = v
-        with self.block.alloc_temp() as wrapped:
-          if v.startswith(_NATIVE_TYPE_PREFIX):
-            module_attr = v[len(_NATIVE_TYPE_PREFIX):]
-            with self.block.alloc_temp(
-                '{}.{}'.format(package.alias, module_attr)) as type_:
-              self.writer.write_checked_call2(
-                  wrapped, 'πg.WrapNative(πF, {}.ValueOf({}))',
-                  reflect_package.alias, type_.expr)
-              self.writer.write('{} = {}.Type().ToObject()'.format(
-                  wrapped.name, wrapped.expr))
-          else:
-            self.writer.write_checked_call2(
-                wrapped, 'πg.WrapNative(πF, {}.ValueOf({}.{}))',
-                reflect_package.alias, package.alias, v)
-          self.writer.write('{}[{}] = {}'.format(
-              members.name, util.go_str(module_attr), wrapped.expr))
-      self.writer.write_checked_call2(mod, 'πg.ImportNativeModule(πF, {}, {})',
-                                      util.go_str(name), members.expr)
-    return mod
 
   def _tie_target(self, target, value):
     if isinstance(target, ast.Name):
@@ -825,6 +656,44 @@ class StatementVisitor(algorithm.Visitor):
     for node in nodes:
       self.visit(node)
 
+  def _visit_loop(self, testfunc, node):
+    start_label = self.block.genlabel(is_checkpoint=True)
+    else_label = self.block.genlabel(is_checkpoint=True)
+    end_label = self.block.genlabel()
+    with self.block.alloc_temp('bool') as breakvar:
+      self.block.push_loop(breakvar)
+      self.writer.write('πF.PushCheckpoint({})'.format(else_label))
+      self.writer.write('{} = false'.format(breakvar.name))
+      self.writer.write_label(start_label)
+      self.writer.write_tmpl(textwrap.dedent("""\
+          if πE != nil || πR != nil {
+          \tcontinue
+          }
+          if $breakvar {
+          \tπF.PopCheckpoint()
+          \tgoto Label$end_label
+          }"""), breakvar=breakvar.expr, end_label=end_label)
+      with self.block.alloc_temp('bool') as testvar:
+        testfunc(testvar)
+        self.writer.write_tmpl(textwrap.dedent("""\
+            if πE != nil || !$testvar {
+            \tcontinue
+            }
+            πF.PushCheckpoint($start_label)\
+            """), testvar=testvar.name, start_label=start_label)
+      self._visit_each(node.body)
+      self.writer.write('continue')
+      # End the loop so that break applies to an outer loop if present.
+      self.block.pop_loop()
+      self.writer.write_label(else_label)
+      self.writer.write(textwrap.dedent("""\
+          if πE != nil || πR != nil {
+          \tcontinue
+          }"""))
+      if node.orelse:
+        self._visit_each(node.orelse)
+      self.writer.write_label(end_label)
+
   def _write_except_block(self, label, exc, except_node):
     self._write_py_context(except_node.lineno)
     self.writer.write_label(label)
@@ -832,7 +701,6 @@ class StatementVisitor(algorithm.Visitor):
       self.block.bind_var(self.writer, except_node.name.id,
                           '{}.ToObject()'.format(exc))
     self._visit_each(except_node.body)
-    self.writer.write('πE = nil')
     self.writer.write('πF.RestoreExc(nil, nil)')
 
   def _write_except_dispatcher(self, exc, tb, handlers):

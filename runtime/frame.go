@@ -70,7 +70,7 @@ func (f *Frame) release() {
 		// TODO: Track cache depth and release memory.
 		f.frameCache, f.back = f, f.frameCache
 		// Clear pointers early.
-		f.dict = nil
+		f.setDict(nil)
 		f.globals = nil
 		f.code = nil
 	} else if f.back != nil {
@@ -270,6 +270,14 @@ func (f *Frame) FreeArgs(args Args) {
 // FrameType is the object representing the Python 'frame' type.
 var FrameType = newBasisType("frame", reflect.TypeOf(Frame{}), toFrameUnsafe, ObjectType)
 
+func frameExcClear(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
+	if raised := checkMethodArgs(f, "__exc_clear__", args, FrameType); raised != nil {
+		return nil, raised
+	}
+	toFrameUnsafe(args[0]).RestoreExc(nil, nil)
+	return None, nil
+}
+
 func frameExcInfo(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) {
 	if raised := checkMethodVarArgs(f, "__exc_info__", args, FrameType); raised != nil {
 		return nil, raised
@@ -287,5 +295,6 @@ func frameExcInfo(f *Frame, args Args, kwargs KWArgs) (*Object, *BaseException) 
 
 func initFrameType(dict map[string]*Object) {
 	FrameType.flags &= ^(typeFlagInstantiable | typeFlagBasetype)
+	dict["__exc_clear__"] = newBuiltinFunction("__exc_clear__", frameExcClear).ToObject()
 	dict["__exc_info__"] = newBuiltinFunction("__exc_info__", frameExcInfo).ToObject()
 }

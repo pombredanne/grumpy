@@ -22,12 +22,11 @@ import abc
 import collections
 import re
 
-from pythonparser import algorithm
-from pythonparser import ast
-from pythonparser import source
-
 from grumpy.compiler import expr
 from grumpy.compiler import util
+from grumpy.pythonparser import algorithm
+from grumpy.pythonparser import ast
+from grumpy.pythonparser import source
 
 
 _non_word_re = re.compile('[^A-Za-z0-9_]')
@@ -46,9 +45,8 @@ class Package(object):
 class Loop(object):
   """Represents a for or while loop within a particular block."""
 
-  def __init__(self, start_label, end_label):
-    self.start_label = start_label
-    self.end_label = end_label
+  def __init__(self, breakvar):
+    self.breakvar = breakvar
 
 
 class Block(object):
@@ -125,8 +123,8 @@ class Block(object):
     self.used_temps.remove(v)
     self.free_temps.add(v)
 
-  def push_loop(self):
-    loop = Loop(self.genlabel(), self.genlabel())
+  def push_loop(self, breakvar):
+    loop = Loop(breakvar)
     self.loop_stack.append(loop)
     return loop
 
@@ -144,20 +142,16 @@ class Block(object):
 
 
 class ModuleBlock(Block):
-  """Python block for a module.
+  """Python block for a module."""
 
-  Attributes:
-    imports: A dict mapping fully qualified Go package names to Package objects.
-  """
-
-  def __init__(self, path, full_package_name, filename, src, future_features):
+  def __init__(self, importer, full_package_name,
+               filename, src, future_features):
     Block.__init__(self, None, '<module>')
-    self.path = path
+    self.importer = importer
     self.full_package_name = full_package_name
     self.filename = filename
     self.buffer = source.Buffer(src)
     self.strings = set()
-    self.imports = {}
     self.future_features = future_features
 
   def bind_var(self, writer, name, value):
@@ -171,26 +165,6 @@ class ModuleBlock(Block):
 
   def resolve_name(self, writer, name):
     return self._resolve_global(writer, name)
-
-  def add_import(self, name):
-    """Register the named Go package for import.
-
-    Args:
-      name: The fully qualified Go package name.
-    Returns:
-      A Package representing the import.
-    """
-    return self.add_native_import('__python__/' + name)
-
-  def add_native_import(self, name):
-    alias = None
-    if name == 'grumpy':
-      alias = 'πg'
-    if name in self.imports:
-      return self.imports[name]
-    package = Package(name, alias)
-    self.imports[name] = package
-    return package
 
   def intern(self, s):
     if len(s) > 64 or _non_word_re.search(s):

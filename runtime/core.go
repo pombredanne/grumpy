@@ -18,9 +18,15 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"sync/atomic"
 )
 
-var logFatal = func(msg string) { log.Fatal(msg) }
+var (
+	logFatal = func(msg string) { log.Fatal(msg) }
+	// ThreadCount is the number of goroutines started with StartThread that
+	// have not yet joined.
+	ThreadCount int64
+)
 
 // Abs returns the result of o.__abs__ and is equivalent to the Python
 // expression "abs(o)".
@@ -182,17 +188,34 @@ func FloorDiv(f *Frame, v, w *Object) (*Object, *BaseException) {
 	return binaryOp(f, v, w, v.typ.slots.FloorDiv, v.typ.slots.RFloorDiv, w.typ.slots.RFloorDiv, "//")
 }
 
-// FormatException returns a single-line exception string for the given
-// exception object, e.g. "NameError: name 'x' is not defined\n".
-func FormatException(f *Frame, e *BaseException) (string, *BaseException) {
-	s, raised := ToStr(f, e.ToObject())
+// FormatExc calls traceback.format_exc, falling back to the single line
+// exception message if that fails, e.g. "NameError: name 'x' is not defined\n".
+func FormatExc(f *Frame) (s string) {
+	exc, tb := f.ExcInfo()
+	defer func() {
+		if s == "" {
+			strResult, raised := ToStr(f, exc.ToObject())
+			if raised == nil && strResult.Value() != "" {
+				s = fmt.Sprintf("%s: %s\n", exc.typ.Name(), strResult.Value())
+			} else {
+				s = exc.typ.Name() + "\n"
+			}
+		}
+		f.RestoreExc(exc, tb)
+	}()
+	tbMod, raised := SysModules.GetItemString(f, "traceback")
+	if raised != nil || tbMod == nil {
+		return
+	}
+	formatExc, raised := GetAttr(f, tbMod, NewStr("format_exc"), nil)
 	if raised != nil {
-		return "", raised
+		return
 	}
-	if len(s.Value()) == 0 {
-		return e.typ.Name() + "\n", nil
+	result, raised := formatExc.Call(f, nil, nil)
+	if raised != nil || !result.isInstance(StrType) {
+		return
 	}
-	return fmt.Sprintf("%s: %s\n", e.typ.Name(), s.Value()), nil
+	return toStrUnsafe(result).Value()
 }
 
 // GE returns the result of operation v >= w.
@@ -297,6 +320,12 @@ func IDiv(f *Frame, v, w *Object) (*Object, *BaseException) {
 	return inplaceOp(f, v, w, v.typ.slots.IDiv, Div)
 }
 
+// IFloorDiv returns the result of v.__ifloordiv__ if defined, otherwise falls back to
+// floordiv.
+func IFloorDiv(f *Frame, v, w *Object) (*Object, *BaseException) {
+	return inplaceOp(f, v, w, v.typ.slots.IFloorDiv, FloorDiv)
+}
+
 // ILShift returns the result of v.__ilshift__ if defined, otherwise falls back
 // to lshift.
 func ILShift(f *Frame, v, w *Object) (*Object, *BaseException) {
@@ -328,6 +357,11 @@ func Invert(f *Frame, o *Object) (*Object, *BaseException) {
 // IOr returns the result of v.__ior__ if defined, otherwise falls back to Or.
 func IOr(f *Frame, v, w *Object) (*Object, *BaseException) {
 	return inplaceOp(f, v, w, v.typ.slots.IOr, Or)
+}
+
+// IPow returns the result of v.__pow__ if defined, otherwise falls back to IPow.
+func IPow(f *Frame, v, w *Object) (*Object, *BaseException) {
+	return inplaceOp(f, v, w, v.typ.slots.IPow, Pow)
 }
 
 // IRShift returns the result of v.__irshift__ if defined, otherwise falls back
@@ -769,14 +803,12 @@ func SetItem(f *Frame, o, key, value *Object) *BaseException {
 // StartThread runs callable in a new goroutine.
 func StartThread(callable *Object) {
 	go func() {
+		atomic.AddInt64(&ThreadCount, 1)
+		defer atomic.AddInt64(&ThreadCount, -1)
 		f := NewRootFrame()
 		_, raised := callable.Call(f, nil, nil)
 		if raised != nil {
-			s, raised := FormatException(f, raised)
-			if raised != nil {
-				s = raised.String()
-			}
-			Stderr.writeString(s)
+			Stderr.writeString(FormatExc(f))
 		}
 	}()
 }
